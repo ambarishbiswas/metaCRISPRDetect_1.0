@@ -30,7 +30,7 @@ Beside that you only need to install Megahit (version 1.2.9 or higher) or SPAdes
 
 #### metaCRISPRDetect commandline parmeters:
 
-Options for input sequence(s) in FASTA format :
+  Options for input sequence(s) in FASTA format :
 
  	-i/-f	input_fasta_sequence_file	[either gzip compressed (i.e. with extension .gz) or uncompressed FASTA sequence file. Supported extensions are .fa, .fna, .fasta ]
 	
@@ -48,28 +48,33 @@ Options for input sequence(s) in FASTA format :
 
 
   Options specific for reads in the inputted FASTA/FASQ file :
+  
  	-read_error_correction	0/1	[Default is set to 1 (recomended). To skip error correction use 0]
  	-min_read_length	20	[Default value set to 20, Any positive integer is supported]
 
 
   Options of assembly of reads in the inputted sequence file :
+  
  	-use_ref_repeats_from_assembly	0/1	[Default is set to 0, which means no assembly will be done and CRISPR arrays will only be predicted from the inputted FASTA/FASTQ reads/sequences]
  	-assembler	megahit/spades	[Default set to Megahit; to use SPAdes assembler specify "-assembler spades"]
  	-assembled_contigs	FASTA_seq_file	[specify an existing (multi)FASTA sequence file, which will be used for generating reference CRISPR repeats library. File with extension .gz is supported]
 
 
   Options for filtering CRISPR arrays :
+  
  	-array_quality_score_cutoff	numeric_value	[default is set to 3, any positive or negative real numeric value is supported]
  	-minimum_no_of_repeats	integer_value	[Default is set to 2, any positive integer >1 is supported]
 
 
   Options for additional file/format :
+  
  	-create_repeats_fasta_file	0/1	[Default is set to 0, Use "1" to create a multiFASTA sequence file containing the repeats]
  	-create_spacers_fasta_file	0/1	[Default is set to 0, Use "1" to create a multiFASTA sequence file containing the spacers]
  	-create_gff_file	0/1	[Default is set to 0, Use "1" to create a GFF file containing the CRISPR element details]
 
 
   Other options :
+  
  	-T/-threads	number_of_threads	[By default the program uses 4 threads; Any positive integer is accepted]
  	-q/-quiet	0/1	[Default is set to 0, which shows program step-by-step logs; Use "1" to turn of the logging; Note, a file log.log will still be created in the output_folder]
  	-h/--h/-help/--help		[Shows this help]
