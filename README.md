@@ -30,13 +30,17 @@ Beside that you only need to install Megahit (version 1.2.9 or higher) or SPAdes
 
 #### metaCRISPRDetect commandline parmeters:
 
-  Options for input sequence(s) in FASTA format :
+Options for input sequence(s) in FASTA format :
+
  	-i/-f	input_fasta_sequence_file	[either gzip compressed (i.e. with extension .gz) or uncompressed FASTA sequence file. Supported extensions are .fa, .fna, .fasta ]
- 	-o/-out_dir	a_folder_name	[A folder with the provided name will be created in the current directory; No "/" or "\" is accepted]
- 	-sid/-sample_id	TEXT	[This is a compulsory option; typical examples are: NCBI accessions, SRA accessions or any alphanumeric text ]
+	
+	-o/-out_dir	a_folder_name	[A folder with the provided name will be created in the current directory; No "/" or "\" is accepted]
+ 	
+	-sid/-sample_id	TEXT	[This is a compulsory option; typical examples are: NCBI accessions, SRA accessions or any alphanumeric text ]
 
 
   Options for input sequence(s) in FASTQ format ONLY :
+  
  	-s/-r	input_fastq_sequence_file	[A FASTQ file. Supported extensions are .fq, .fastq with/without gzip compression (i.e. with extension .gz) ]
 	-1	forward_fastq_file	[Specify the forward reads FASTQ file of paired-end libraries. Supported extensions are .fq, .fastq with/without gzip compression (i.e. with extension .gz)]
 	-2	reverse_fastq_file	[Specify the reverse reads FASTQ file of paired-end libraries. Supported extensions are .fq, .fastq with/without gzip compression (i.e. with extension .gz)]
