@@ -1,0 +1,4875 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use utf8;
+use Cwd 'abs_path';
+use Term::ANSIColor;
+use List::Util 'shuffle';
+
+use FindBin qw($Bin);
+#use lib "$Bin/lib";                
+
+our $version="1.0";
+
+
+###---- (A) Logic: FAST reference guided predictions ---
+#-------- 1: blast the reads against the database of reference repeats
+#-------- 2: process the blast output to identify reads (load the reads in a hash hash_of_potential_crispr_containing_read_ids) with at least 1 proper match to the reference repeats (over the full length)
+#-------- 3: reanalyze the blast output and for the identified reads in the last step, check if they contain at least one and half repeats; this will also lead to identify singleton repeat-like sequence (likely false positive)
+#-------- 4: create individual CRISPRs with format, that is supported by CRISPRDetect module (i.e. @current_array)
+
+#------ (B) Logic: SENSITIVE de-novo prediction method
+#-------- 5: process the rest of the reads using CRISPRDetect's HOT-SPOT finding algorithm
+#-------- 6: analyze the hotspots to identify >=2.5 repeats (as, just 2 repeats CRISPRs are not good indicator of its genuineness) containing reads
+#-------- 7: process the hot-spots to identify CRISPRs--
+#-------- 8: make a repeat DB using the newly identified repeats, and do a second blastn
+#-------- 9: analyze blastn to identify singleton repeats [i.e. these are genomic repeats and not CRISPR DRs]
+#------- 10: move the false-positive CRISPRs to .fp file 
+
+
+our $sample_id="";
+
+#--- input file options
+our $input_fasta_file="";
+our $single_fastq_file="";
+our $forward_fastq_file="";
+our $reverse_fastq_file="";
+our $interleaved_fastq_file="";
+our $sra="";
+our $ena="";
+#--- fastq specific options
+our $read_error_correction=1;
+our $min_read_length=20;
+our $subsample_reads_to=0;
+our $subsample_reads_min_length=75;
+
+#-- CRISPR: prediction and filtering options
+our $use_refseq_reference_repeats=1;			
+our $use_metagenomic_reference_repeats=1;			
+our $use_ref_repeats_from_assembly=0;
+our $reference_crisprs="";
+our $user_reference_repeats="";                       #-- Note: the sequence headers must NOT contain "|"; if contains "|"; will be replaced with '-'
+our $only_use_user_reference_repeats=0;
+
+#--- assembly options
+our $predict_crisprs_in_assembly=0;	
+our $assembler="megahit";
+our $assembled_contigs_file="";
+		
+
+#--- reads options 
+our $predict_crisprs_in_reads=1;					
+	
+our $array_quality_score_cutoff=4;
+our $minimum_no_of_repeats=2;
+
+#-- CRISPR: create additional file options
+our $create_repeats_fasta_file=0;
+our $create_spacers_fasta_file=0;
+our $create_gff_file=0;
+
+#--- other options
+our $out_dir;
+our $number_of_threads=32;
+our $quiet=0;
+our $show_help=0;
+our $show_version=0;
+
+our $preserve_input_sequenceIDs=1;
+
+#-------------- input parameters -----------------------------------------
+#our $CRISPRDetect_ref_repeatDB="$Bin/REF_FILES/REF_REPEATS.REFSEQ_AND_METAGENOMIC.db";
+
+my $at_least_one_input_sequence_file_provided=0;
+
+for(my $i=0;$i<=$#ARGV;$i++)
+	{
+		if($ARGV[$i]=~/-sample_id$/i or $ARGV[$i]=~/-sID$/i )
+			{
+				$sample_id=$ARGV[$i+1];	
+								
+			}				
+		#---- input options 
+		elsif($ARGV[$i]=~/-i$/i or $ARGV[$i]=~/-f$/i)
+			{
+				$input_fasta_file=$ARGV[$i+1];
+				
+				$at_least_one_input_sequence_file_provided++;					
+			}
+		elsif($ARGV[$i]=~/-s$/i or $ARGV[$i]=~/-r$/i)
+			{
+				$single_fastq_file=$ARGV[$i+1];	
+				$at_least_one_input_sequence_file_provided++;									
+			}
+		elsif($ARGV[$i]=~/-1$/i)
+			{
+				$forward_fastq_file=$ARGV[$i+1];
+				$at_least_one_input_sequence_file_provided++;										
+			}
+		elsif($ARGV[$i]=~/-2$/i)
+			{
+				$reverse_fastq_file=$ARGV[$i+1];
+				$at_least_one_input_sequence_file_provided++;										
+			}
+		elsif($ARGV[$i]=~/--12$/i)
+			{
+				$interleaved_fastq_file=$ARGV[$i+1];
+				$at_least_one_input_sequence_file_provided++;							
+			}
+		
+		#---- reads specific options
+		
+		elsif($ARGV[$i]=~/-read_error_correction$/i)
+			{
+				$read_error_correction=$ARGV[$i+1];					
+			}
+		elsif($ARGV[$i]=~/-min_read_length$/i)
+			{
+				$min_read_length=$ARGV[$i+1];					
+			}
+		elsif($ARGV[$i]=~/-subsample_reads_size$/i)
+			{
+				$subsample_reads_to=$ARGV[$i+1];					
+			}
+		elsif($ARGV[$i]=~/-subsample_reads_min_length$/i)
+			{
+				$subsample_reads_min_length=$ARGV[$i+1];					
+			}
+		#--- reads assembly options ----
+		
+		elsif($ARGV[$i]=~/-assembler$/i)
+			{
+				$assembler=$ARGV[$i+1];		
+				if($assembler !~/megahit/i or $assembler !~/spades/i)
+					{
+						print "The supported assembly tools are megahit and spades. Please specify either megahit or spades using -assembler parameter (e.g. -assembler spades). Program terminating.\n";exit;
+					}			
+			}
+		
+		
+		elsif($ARGV[$i]=~/-assembled_contigs_file$/i)
+			{
+				$assembled_contigs_file=$ARGV[$i+1];					
+			}			
+		elsif($ARGV[$i]=~/-predict_crisprs_in_assembly$/i)
+			{
+				$predict_crisprs_in_assembly=$ARGV[$i+1];					
+			}	
+			
+		#---- CRISPR prediction and filtering options ------------ 		
+		elsif($ARGV[$i]=~/-use_refseq_reference_repeats$/i)
+			{
+				$use_refseq_reference_repeats=$ARGV[$i+1];					
+			}
+		elsif($ARGV[$i]=~/-use_metagenomic_reference_repeats$/i)
+			{
+				$use_metagenomic_reference_repeats=$ARGV[$i+1];					
+			}
+		elsif($ARGV[$i]=~/-use_ref_repeats_from_assembly$/i)
+			{
+				$use_ref_repeats_from_assembly=$ARGV[$i+1];					
+			}
+		elsif($ARGV[$i]=~/-reference_crisprs$/i)
+			{
+				$reference_crisprs=$ARGV[$i+1];					
+			}	
+		elsif($ARGV[$i]=~/-user_reference_repeats$/i)
+			{
+				$user_reference_repeats=$ARGV[$i+1];					
+			}
+		elsif($ARGV[$i]=~/-only_use_user_reference_repeats$/i)
+			{
+				$only_use_user_reference_repeats=$ARGV[$i+1];					
+			}	
+		#--- reference database option
+			
+			
+		
+		
+		elsif($ARGV[$i]=~/-predict_crisprs_in_reads$/i)
+			{
+				$predict_crisprs_in_reads=$ARGV[$i+1];					
+			}		
+		elsif($ARGV[$i]=~/-array_quality_score_cutoff$/i)
+			{
+				$array_quality_score_cutoff=$ARGV[$i+1];					
+			}
+		elsif($ARGV[$i]=~/-minimum_no_of_repeats$/i)
+			{
+				$minimum_no_of_repeats=$ARGV[$i+1];					
+			}
+		
+		#---- downstream different file creation options --
+		elsif($ARGV[$i]=~/-create_repeats_fasta_file$/i)
+			{
+				$create_repeats_fasta_file=$ARGV[$i+1];					
+			}
+		elsif($ARGV[$i]=~/-create_spacers_fasta_file$/i)
+			{
+				$create_spacers_fasta_file=$ARGV[$i+1];					
+			}
+		elsif($ARGV[$i]=~/-create_gff_file$/i)
+			{
+				$create_gff_file=$ARGV[$i+1];					
+			}
+		#---- output option
+		elsif($ARGV[$i]=~/-o$/i or $ARGV[$i]=~/-out_dir$/i)
+			{
+				$out_dir=$ARGV[$i+1];					
+			}		
+		#---- other options				
+		elsif($ARGV[$i]=~/-T$/i)
+			{
+				$number_of_threads=$ARGV[$i+1];					
+			}
+		elsif($ARGV[$i]=~/-q$/i or $ARGV[$i]=~/-quiet$/i)
+			{
+				$quiet=$ARGV[$i+1];					
+			}
+		elsif($ARGV[$i]=~/-h$/i or $ARGV[$i]=~/--h$/i or $ARGV[$i]=~/-help$/i or $ARGV[$i]=~/--help$/i)
+			{
+				$show_help=1;					
+			}		
+		elsif($ARGV[$i]=~/-v$/i or $ARGV[$i]=~/-version$/i)
+			{
+				$show_version=1;					
+			}
+		
+		#--- additional option
+		elsif($ARGV[$i]=~/-preserve_input_sequenceIDs$/i)
+			{
+				$preserve_input_sequenceIDs=$ARGV[$i+1];					
+			}			
+	}
+	
+############ display version/help
+if($show_version==1)
+	{
+		print "metaCRISPRDetect version: $version\n";exit;
+	}
+#--- show help and exit
+if($show_help==1 or $#ARGV<1)
+	{
+		&display_help();exit;
+	}
+	
+######### check to make sure the minimum requirements are met to run the job
+if($sample_id !~/\S/)
+	{
+		print "You must specify a sample_id. Program terminating. See help.\n";exit;
+	}
+#-- check if input and output is provided	
+if($at_least_one_input_sequence_file_provided==0 )
+	{
+		print "Error: Missing input sequence file. Please refer to the help document\n"; exit;			
+		
+		#print "   Error: Please provide the input and output in this manner:\n\n\t $0 -i input_reads_file -o output_directory_name        [Optional: -T number_of_threads -quiet 0/1 ] \n\n"; exit;
+	}
+if($out_dir !~/\S+/)
+	{
+		print "Error: Missing output directory name. Make sure the folder doesn't contain any "/" in the beginning. Please refer to the help document for more information\n"; exit;
+	}	
+
+if($forward_fastq_file and $forward_fastq_file=~/\S+/ and (not $reverse_fastq_file or $reverse_fastq_file!~/\S+/))
+	{
+		print "Error: Missing the reverse fastq file. Please specify the reverse fastq file using -2 . Program terminating\n"; exit;
+	}
+
+if($reverse_fastq_file and $reverse_fastq_file=~/\S+/ and (not $forward_fastq_file or $forward_fastq_file!~/\S+/))
+	{
+		print "Error: Missing the forward fastq file. Please specify the forward fastq file using -1 . Program terminating\n"; exit;
+	}
+
+
+
+#--- check the reference DB option --
+if($use_refseq_reference_repeats ==0 and $use_metagenomic_reference_repeats ==0 and $use_ref_repeats_from_assembly==0)
+	{
+		print "None of the Reference repeat databases are selected. The metaCRISPRDetect will perform assembly and use reference repeats from assemblies.\n";
+		$use_ref_repeats_from_assembly=1;
+	}
+
+
+
+#---- create the output folder
+our $cwd_dir=`pwd >&1`; chomp $cwd_dir;$cwd_dir=~s/\r//;
+
+if($out_dir!~/^\//)
+	{
+		$out_dir="$cwd_dir/$out_dir";
+	}
+
+unless(-d "$out_dir")
+	{
+		system("mkdir -p $out_dir");
+	}
+#---- create a temp directory
+#print "\n$out_dir\n";
+
+
+
+our $tmp_dir="$out_dir/temp";
+
+
+unless(-d "$tmp_dir")
+	{
+		system("mkdir -p $tmp_dir");
+	
+		if($quiet==0)
+			{
+				print "\tCheck: $tmp_dir\n";	#exit;	
+			}
+	}
+
+
+our $output_crispr_file="$out_dir/$sample_id.metaCRISPRDetect_output.txt";
+
+
+
+
+
+
+
+############### do not change the code below unless you know what you doing
+
+#----- create threads ---
+if($number_of_threads < 1)
+	{
+		$number_of_threads=1;
+	}
+use Parallel::ForkManager;
+my $pm = new Parallel::ForkManager($number_of_threads);
+
+
+
+############ declare the hashes needed later on
+our %hash_of_readID_and_seq;
+our %hash_of_contigID_and_seq;
+
+	
+###########################################################----Step1: handle the input file(s) and create input_fasta_sequences
+our $input_fasta_sequences="$tmp_dir/$sample_id.reads.fa";
+if(not -e "$input_fasta_sequences")
+	{
+		#---- process the user input
+		&process_input_reads_files();		
+		
+		#-- check if file created
+		if(not -e "$input_fasta_sequences")
+			{
+				print "Error: No supported input sequence file (i.e. FASTA/FASTQ reads) provided/found. Program terminating.\n"; exit;
+			}
+		else{
+				print "Check: $input_fasta_sequences\n"; 
+				#my @arr_headers=`head $input_fasta_sequences >&1`;
+				#print "@arr_headers\n";
+			}	
+	}
+				
+
+
+		
+#-- check if reads file created
+my $nof_sequences=`grep '^>' $input_fasta_sequences | wc -l >&1`; chomp $nof_sequences; $nof_sequences=~s/\r//;
+if($nof_sequences<=0 )
+	{
+		system("rm $input_fasta_sequences");
+		print "Error: No supported input sequence file (i.e. FASTA/FASTQ reads) provided/found. Program terminating.\n"; exit;
+	}
+
+
+
+
+
+
+
+
+##########################################################----Step2: check if assembly is requested/needed ---
+our $assembled_contigs="$tmp_dir/$sample_id.contigs.fa";
+if(not -e "$assembled_contigs"  and ($use_ref_repeats_from_assembly ==1 or $predict_crisprs_in_assembly==1))
+	{
+		#--process user given contigs or do the assembly
+		&handle_assembly();
+		
+		if($quiet==0)
+			{		
+				print "Check: $assembled_contigs\n"; 
+		
+				#----
+				#my @arr_headers=`head $assembled_contigs >&1`;
+				#print "@arr_headers\n";
+				#---
+			}
+	}
+
+
+
+
+
+############## load the sequences in hashes
+if($use_ref_repeats_from_assembly ==1 or $predict_crisprs_in_assembly==1)
+	{
+		#--- load the contigID and sequences in hash ---
+		&load_seqID_and_seq_in_hash($assembled_contigs,\%hash_of_contigID_and_seq);
+	}
+
+
+if($predict_crisprs_in_reads==1)
+	{
+		##-------- load the inputted reads in hash
+		&load_seqID_and_seq_in_hash($input_fasta_sequences,\%hash_of_readID_and_seq); 
+	}
+
+
+
+########################################## subsample the reads to the given integer [if specified]
+
+our	$subsampled_reads_file="$out_dir/$sample_id.subsampled_reads.fa";		
+if($subsample_reads_to >0)
+	{		
+		if(not -e "$subsampled_reads_file")
+			{
+				if($quiet==0)
+					{
+						print "\t\tStep 1.5:Program is going to create a subsampled_reads file containing maximum $subsample_reads_to reads with minimum read length of $subsample_reads_min_length ..\n";
+					}
+				#-----	subsample the reads
+				my %hash_of_selected_readID_and_seq;
+				&subsample_reads_to_specified_number(\%hash_of_selected_readID_and_seq);
+				
+				
+				
+				#--- now undef the %hash_of_readID_and_seq
+				undef %hash_of_readID_and_seq;
+				
+				#-- now copy the %hash_of_selected_readID_and_seq to %hash_of_readID_and_seq
+				%hash_of_readID_and_seq=%hash_of_selected_readID_and_seq;
+			}
+		else{
+				#--- load the ID and sequences of the subsampled reads in a hash, and replace the main hash with the subsmaple hash
+				my %hash_of_selected_readID_and_seq;
+				&load_seqID_and_seq_in_hash($subsampled_reads_file,\%hash_of_selected_readID_and_seq);
+				
+				#--- now undef the %hash_of_readID_and_seq
+				undef %hash_of_readID_and_seq;
+				
+				#-- now copy the %hash_of_selected_readID_and_seq to %hash_of_readID_and_seq
+				%hash_of_readID_and_seq=%hash_of_selected_readID_and_seq;
+			}	
+	}
+
+
+
+
+##########################################################----Step3: predict crisprs from assembly/user given contigs	unless a previously predicted CRISPRs file is supplied by the user
+our $reference_crispr_detect_output="$tmp_dir/reference_crisprdetect_output.txt";	
+if($reference_crisprs and $reference_crisprs=~/\S+/)
+	{
+		system("cp $reference_crisprs $reference_crispr_detect_output");
+	}
+elsif(not -e "$reference_crispr_detect_output" and ($use_ref_repeats_from_assembly ==1 or $predict_crisprs_in_assembly==1) )
+	{			
+		#--- now predict CRISPRs from the assembly using CRISPRDetect 3.0--
+		if($quiet==0)
+			{
+				print "Predicting CRISPRs from assembly/user given reference sequences..\n";
+			}			
+		system("CRISPRDetect3 -f $assembled_contigs -o $reference_crispr_detect_output -minimum_word_repeatation 3 -minimum_no_of_repeats 3 -array_quality_score_cutoff 3 -wgs 0 -q 0 -T $number_of_threads >/dev/null");
+		
+	}
+
+
+
+
+
+
+
+
+
+#########################################################---- Step4: Define reference repeat DB; if assembly was requested/provided add the newly identified repeats to the database
+
+#--- define some parameters
+our $min_no_of_seq_in_a_cluster=2;
+our $keep_seq_id=0;
+our $preserve_cluster_index=0;
+
+our $remove_identical_sequences=1;
+
+our $identify_cluster_direction_from_the_sequence_header=1; #--- special case to handle CRISPRDetect predicted repeats
+our $identify_cluster_direction_using_majority_rule=0;
+		
+
+
+our $reference_repeatDB="$tmp_dir/BLAST_DB_OF_REF_REPEATS.fa";
+
+#--- First check if the user only want to search with specific repeat(s): This is specifically applies to experiments such as our Nature comm. paper: where only one/two kind of repeats are expected to be present in the whole data set 
+if(not -e "$reference_repeatDB" and $user_reference_repeats and $user_reference_repeats=~/\S+/ and $only_use_user_reference_repeats >0)
+	{
+		print "Using $user_reference_repeats \n";
+		#----
+		system("cat $user_reference_repeats | sed 's/ /-/g' | sed 's/\|/-/g' >$reference_repeatDB");
+		
+		#--- now make a blastdb
+		system("makeblastdb -in $reference_repeatDB -dbtype nucl >/dev/null 2>/dev/null");
+	}
+#--- add the reference repeats from refseq and metagenomic CRISPRs if selected
+if(not -e "$reference_repeatDB" and ($use_refseq_reference_repeats ==1 or $use_metagenomic_reference_repeats ==1) and $user_reference_repeats !~/\S+/ and $reference_crispr_detect_output !~/\S+/)
+	{
+		if($use_refseq_reference_repeats==1 and $use_metagenomic_reference_repeats==1)
+			{
+				$reference_repeatDB="$Bin/REF_FILES/REF_REPEATS.REFSEQ_AND_METAGENOMIC.db";
+			}
+		elsif($use_refseq_reference_repeats==1)
+			{
+				$reference_repeatDB="$Bin/REF_FILES/REF_REPEATS.REFSEQ.db";
+			}
+		elsif($use_metagenomic_reference_repeats==1)
+			{
+				$reference_repeatDB="$Bin/REF_FILES/REF_REPEATS.METAGENOMIC.db";
+			}	
+	}	
+	
+#--- next check if CRISPRs from assembly should be used or a set of CRISPR arrays predicted by CRISPRDetect is provided
+if(not -e "$reference_repeatDB" and ($use_ref_repeats_from_assembly ==1 or -e $reference_crispr_detect_output) )
+	{
+		my $refseq_or_metagenomic="CUSTOM";
+		my $selected_repeat_sequences="$tmp_dir/selected_repeats_from_assembly.fa";	
+		
+		#---Step1:  process the CRISPRDetect output file and create sequence file with good repeats --	
+			#--- process the crisprdetect output file and select reference repeats that meets the following conditions:
+			#----- 1. there must be >=3 DRs with clear boundary [i.e. if a CRISPR only have 3 DRs then there must be flanking bases present in both side, or total DRs are >3]
+			#----- 2. meets the score cutoff
+			#----- 3. at least 2 DRs without any mutation/insertion/deletions		
+		&identify_good_repeats($refseq_or_metagenomic,$reference_crispr_detect_output,$selected_repeat_sequences);
+			
+		
+		
+		
+		
+		#--- check if any repeats predicted---
+		my $nof_repeats_selected_from_assembly=`grep '^>' $selected_repeat_sequences | wc -l >&1`; chomp $nof_repeats_selected_from_assembly; $nof_repeats_selected_from_assembly=~s/\r//g;
+		
+		if($nof_repeats_selected_from_assembly >0)
+			{		
+				#---
+				if($quiet==0)
+					{
+						print "\tTotal $nof_repeats_selected_from_assembly repeats selected from assembly/reference CRISPRs [user inputted] ..\n";
+					}
+				
+				
+				#--- add the RefSeq repeats if selected
+				if($use_refseq_reference_repeats==1)
+					{
+						system("cat $Bin/REF_FILES/selected_repeats.REFSEQ.fa >>$selected_repeat_sequences")
+					}
+				if($use_metagenomic_reference_repeats==1)
+					{
+						system("cat $Bin/REF_FILES/selected_repeats.METAGENOMIC.fa >>$selected_repeat_sequences")
+					}
+			    
+			    #--- also add the user inputted repeats
+				if($user_reference_repeats and $user_reference_repeats=~/\S+/ and $only_use_user_reference_repeats !=1)
+					{
+						system("cat $user_reference_repeats | sed 's/ /-/g' | sed 's/\|/-/g' >>$selected_repeat_sequences")
+					}
+				
+				
+					
+				#--- Step2: run cd-hit to cluster the repeats --
+				system("cd-hit-est -i $selected_repeat_sequences -o $selected_repeat_sequences.NR -n 3 -c 0.95 -aL 0.90 -aS 0.90 -M 0 -T 0 -d 0 >/dev/null 2>/dev/null");
+					
+				#---- Step3: process the cluster file
+				my $cluster_file="$selected_repeat_sequences.NR.clstr";
+				our $cluster_prefix="REPEAT_$refseq_or_metagenomic\_";
+				
+				my %hash_of_no_of_entries_and_cluster_id;		
+				my %hash_of_cluster_id_and_ordered_entries;			
+				&process_cluster_file_and_load_hashes($cluster_prefix,$selected_repeat_sequences,$cluster_file,\%hash_of_no_of_entries_and_cluster_id,\%hash_of_cluster_id_and_ordered_entries);
+				
+				
+				#--- sort the cluster_ids based on no_of_entries
+				my @sorted_cluster_ids;
+				foreach my $nof_entries(sort{$b<=>$a} keys %hash_of_no_of_entries_and_cluster_id)
+					{
+						foreach my $cluster_id(sort{length($hash_of_no_of_entries_and_cluster_id{$nof_entries}{$b})<=>length($hash_of_no_of_entries_and_cluster_id{$nof_entries}{$a})} keys %{$hash_of_no_of_entries_and_cluster_id{$nof_entries}})
+							{
+								push(@sorted_cluster_ids,$cluster_id);
+							}
+					}	
+							
+				
+				
+				#---- Step4: now create the db file		
+				
+				open(CR,">$reference_repeatDB");
+				
+				my %hash_of_already_written_sequences;
+				my $new_c_id=0;
+				foreach my $c_id(@sorted_cluster_ids)
+					{		
+						$new_c_id++;
+						
+						#-- get the cluster_size
+						my $cluster_size=keys %{$hash_of_cluster_id_and_ordered_entries{$c_id}};
+						foreach my $seq_index(sort{$a<=>$b} keys %{$hash_of_cluster_id_and_ordered_entries{$c_id}})
+							{
+								my @arr_t1=split('\|',$hash_of_cluster_id_and_ordered_entries{$c_id}{$seq_index});
+								my $seq=$arr_t1[1];
+								
+								if($remove_identical_sequences >0 and $hash_of_already_written_sequences{$seq})
+									{
+										next;
+									}
+								
+												
+								my $seq_id;
+								
+								if($preserve_cluster_index !=0)
+									{
+										$seq_id=$cluster_prefix."CLUSTER_".$new_c_id."-SIZE_".$cluster_size."-S_".$seq_index;
+									}
+								else{
+										$seq_id=$cluster_prefix."CLUSTER_".$c_id."-SIZE_".$cluster_size."-S_".$seq_index;
+									}	
+								
+								if($keep_seq_id!=0)
+									{
+										$seq_id="$seq_id|$arr_t1[0]";
+									}
+									
+								
+								
+								print CR ">$seq_id\n$seq\n";
+								
+								$hash_of_already_written_sequences{$seq}=1;
+							}
+						#print "\n";	
+					}		
+				close(CR);
+				
+				#--- now make a blastdb
+				system("makeblastdb -in $reference_repeatDB -dbtype nucl >/dev/null 2>/dev/null");
+			}
+			
+				
+	}
+
+#--- if still no reference repeatDB is available, then add the reference repeats from refseq and metagenomic CRISPRs if selected
+if(not -e "$reference_repeatDB" and ($use_refseq_reference_repeats ==1 or $use_metagenomic_reference_repeats ==1 or $user_reference_repeats=~/\S+/))
+	{
+				if($use_refseq_reference_repeats==1 and $use_metagenomic_reference_repeats==1)
+					{						
+						system("cat $Bin/REF_FILES/REF_REPEATS.REFSEQ_AND_METAGENOMIC.db >>$reference_repeatDB");
+					}
+				elsif($use_refseq_reference_repeats==1)
+					{						
+						system("cat $Bin/REF_FILES/REF_REPEATS.REFSEQ.db >>$reference_repeatDB");
+					}
+				elsif($use_metagenomic_reference_repeats==1)
+					{						
+						system("cat $Bin/REF_FILES/REF_REPEATS.METAGENOMIC.db >>$reference_repeatDB");
+					}
+				
+				#--- also add user specified repeats [if provided]	
+				if($user_reference_repeats and $user_reference_repeats=~/\S+/)
+					{
+						system("cat $user_reference_repeats | sed 's/ /-/g' | sed 's/\|/-/g' >>$reference_repeatDB");						
+					}	
+				#--- now make the blastdb
+				system("makeblastdb -in $reference_repeatDB -dbtype nucl >/dev/null 2>/dev/null");		
+	}
+
+
+if($quiet==0)
+	{
+		print "\n\t\tThe reference_repeatDB for this analysis is: $reference_repeatDB\n";
+	}
+#exit;
+
+
+
+
+
+#----- load the good reference seqID and sequence in a hash
+our %hash_of_ref_repeat_seqID_and_seq;
+our %hash_of_repeat_seq_and_seqID;
+
+		
+#----- handle the input file and load the original seqID and sequences in hash ---
+our %hash_of_read_id_and_seq;
+our %hash_of_simplified_read_id_and_original_read_id;
+
+
+	
+
+
+
+
+
+#--- apply blastn based metaCRISPRDetect module [instead of the traditional looking CRISPR arrays, this module will produce tabular repeats and spacers]
+
+if($predict_crisprs_in_reads==1)
+	{
+	
+	if($quiet==0)
+		{
+			print "Identifying CRISPRs in reads ..\n";
+		}
+
+	
+	#--- load the database repeat info
+	&load_seqID_and_seq_in_hash_and_seq_to_seqIDs_too($reference_repeatDB,\%hash_of_ref_repeat_seqID_and_seq,\%hash_of_repeat_seq_and_seqID);
+	
+	#---- create a ref_lib_file to be used for CRISPRDetect_3.0	[Note: in docker, the path to the file needs to be adjusted: i.e. anything before the working directory need to be replaced with actual path in the docker]
+	my $user_ref_lib_file="$tmp_dir/user_ref_lib_file.txt";
+	
+	open(WR,">$user_ref_lib_file");
+	foreach my $repeat(sort keys %hash_of_repeat_seq_and_seqID) #--- this will take care of the redundant repeats --
+		{
+			print WR "$repeat\t$hash_of_repeat_seq_and_seqID{$repeat}\n";
+		}	
+	close(WR);
+	
+	#-------
+	
+	
+	
+	#----- split the sequence into smaller files
+	our @arr_splitted_sequence_files;
+	&split_input_sequences_into_n_files($pm,\@arr_splitted_sequence_files);
+
+	#--- check if the blast_DB is created earlier or not
+	unless(-e "$reference_repeatDB.ndb")
+		{
+			system("makeblastdb -in $reference_repeatDB -dbtype nucl >/dev/null 2>/dev/null");
+		}
+
+	#--- now process the smaller files
+	foreach my $small_seq_file(@arr_splitted_sequence_files)
+		{
+			#our $input_reads_file="t1.fa";
+			#our $output_dir_of_reads_analysis="/tmp/mcd";
+
+			#print "Processing: $small_seq_file\n";
+
+			
+			
+
+			$pm->start and next;
+		
+	
+			#--- then process each blastn output file and identify reads --
+			
+						
+			my $blast_output_file="$small_seq_file.blast_output_reference_repeats.blastn";
+			
+			
+			#--- Level0 search:  do the blast --- [Note: blastn works better than blastn-short to identify gaps;]
+			#system("perl /PROJECTS/custom_scripts/split_fasta_sequences_into_n_files_and_do_blast.pl -db $reference_repeatDB -i $input_reads_file -o $blast_output_file -BTASK blastn -BN 1 -BW 7 -n 20 -T 21 -BT 2 -p /tmp/$only_file_name -s reads ");
+			
+			#print "Check 1: $blast_output_file \n";
+			system("blastn -task blastn -perc_identity 90 -word_size 7 -dust no -culling_limit 1 -num_alignments 1 -num_threads 1 -db $reference_repeatDB -query $small_seq_file -out $blast_output_file -outfmt '6 sseqid stitle sstart send qseqid qstart qend sstrand length score mismatch gaps sseq qseq pident qcovs slen qlen' >/dev/null 2>/dev/null");	
+			#print "Check: $blast_output_file \n";
+			
+			
+			
+			#--- identify the reads that contain at-least one proper match to an reference repeat
+			my %hash_of_qryIDs_with_atleast_one_good_hit;
+			my $selected_reads_file="$small_seq_file.selected_reads.fa";
+			
+			&identify_reads_with_at_least_one_and_half_repeat_match($small_seq_file,$blast_output_file,$selected_reads_file,\%hash_of_qryIDs_with_atleast_one_good_hit);		
+			my $nof_reads_with_atleast_one_good_repeat_hit=keys %hash_of_qryIDs_with_atleast_one_good_hit;
+			#print "\tTotal $nof_reads_with_atleast_one_good_repeat_hit reads identified to likely contain CRISPRs ..\n\n";
+			
+			
+			#--- load the selected readID and seq in hash
+			my %hash_of_selected_readID_and_seq;
+			&load_seqID_and_seq_in_hash($selected_reads_file,\%hash_of_selected_readID_and_seq);
+			
+			my $nof_selected_reads=keys %hash_of_selected_readID_and_seq;
+			#print "\t\t\$nof_selected_reads=$nof_selected_reads\n";
+			
+			#--- Level1 search: now reanalyze the blast output [or do a second blastn-short with the identified reads only] and make crisprs 
+			my %hash_of_readIDs_needed_to_be_re_analyzed;
+			my $questionable_crispr_containing_reads1="$small_seq_file.questionable_crispr_containing_reads1.fa";
+			
+			my $crispr_detect_output1="$small_seq_file-1.mCD.txt";			
+			&generate_crisprs($blast_output_file,$selected_reads_file,$crispr_detect_output1,$questionable_crispr_containing_reads1,\%hash_of_selected_readID_and_seq,\%hash_of_readIDs_needed_to_be_re_analyzed);
+					
+			
+			
+			#---- Level3 search: check if there are reads to be processed with CRISPRDetect --
+			my $nof_reads_to_be_processed_with_crisprdetect=keys %hash_of_readIDs_needed_to_be_re_analyzed;
+			my $crispr_detect_output2="$small_seq_file-2.crisprdetect.txt";
+			if($nof_reads_to_be_processed_with_crisprdetect >0)
+				{
+					if($quiet==0)
+						{
+							print "\t\tTotal $nof_reads_to_be_processed_with_crisprdetect reads requires more detailed analaysis ..\n";					
+						}
+					
+					#--- run CRISPRDetect 3.0 on the selected reads [do not use -ref_lib_file $user_ref_lib_file, let the de-novo run to complete first, later match the DRs to the reference database] --	
+					system("CRISPRDetect3 -f $questionable_crispr_containing_reads1 -o $crispr_detect_output2 -minimum_word_repeatation 2 -minimum_no_of_repeats 2 -array_quality_score_cutoff $array_quality_score_cutoff -wgs 0 -q 1 -T 1 >/dev/null");
+				
+					#--- convert the CRISPRDetect output to metaCRISPRDetect output and append to $crispr_detect_output1 ------
+					if(-e $crispr_detect_output2)
+					{
+						my $nof_cd_arrays=`grep '^>' $crispr_detect_output2 | wc -l >&1`;
+						
+						if($nof_cd_arrays and $nof_cd_arrays=~/\d/)
+							{
+								&convert_crisprdetect_formatted_arrays_to_metacrisprdetect_format($crispr_detect_output2,$crispr_detect_output1);
+							}
+					}
+				}		
+			
+			#-----					
+			$pm->finish;			
+		}	
+	$pm->wait_all_children;
+	
+	
+	#--- cat all *.mCD.txt files to identify the modified read_ids
+	`cat $tmp_dir/*.mCD.txt >$output_crispr_file`;
+	
+	#--- cat the contents of .fp files
+	`cat $tmp_dir/*.mCD.txt.fp >$output_crispr_file.fp`;
+	
+	#--- remove the $tmp_dir
+	#system("rm $tmp_dir/splitted_part_*");
+	#print "Check: $tmp_dir\n";
+}
+
+if($quiet==0)
+	{
+		print "\nThe predicted CRISPR arrays are in the following files:\n";
+		print "\tThe qualified CRISPR arrays are in file: $output_crispr_file\n";
+		print "\tThe questionable CRISPR arrays are in file: $output_crispr_file.fp\n";
+		
+	}
+
+######### module : create additional files requested
+our $repeats_fasta_file="$output_crispr_file.repeats.fasta";
+our $spacers_fasta_file="$output_crispr_file.spacers.fasta";
+our $gff_file="$output_crispr_file.gff";
+
+if($create_repeats_fasta_file==1 or $create_spacers_fasta_file==1 or $create_gff_file==1)
+	{
+		if($quiet==0)
+			{
+				print "\nCreating additional files:\n";
+			}
+		
+		#---- create the additional files requested	
+		&create_additional_files($output_crispr_file,$repeats_fasta_file,$spacers_fasta_file,$gff_file);
+		
+		#--- print the files created --
+		if($quiet==0)
+			{
+				if($create_repeats_fasta_file==1)
+					{
+						print "\tCRISPR representative repeat sequence are in file: $repeats_fasta_file\n";
+					}
+				if($create_spacers_fasta_file==1)
+					{
+						print "\tCRISPR spacer sequence are in file: $spacers_fasta_file\n";						
+					}
+				if($create_gff_file==1)
+					{
+						print "\tThe GFF representation of the CRISPR arrays are in file: $gff_file\n";						
+					}
+			}
+	}
+
+
+	
+
+exit;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#################### metaCRISPRDetect: new subs #############################
+
+
+sub process_input_reads_files()
+	{
+		
+		
+		
+		#-- handle fasta seq files
+		if($input_fasta_file and $input_fasta_file=~/\S+/)
+			{				
+				#--- check if readIDs should be preserved
+				my $tmp_sample_id="";
+				if($preserve_input_sequenceIDs==0)
+					{
+						$tmp_sample_id=$sample_id;
+					}
+				#----
+				if($read_error_correction==1)
+					{
+						#--- check if error correction is turned on: call bbmap to do the nasty work
+						if($quiet==0)
+							{
+								print "\tCleaning: $input_fasta_file\n";
+							}
+						my $ret=`bbduk.sh -Xmx20G interleaved=auto overwrite=t in1=$input_fasta_file ref=$Bin/resources/adapters.fa ktrim=r k=23 mink=11 hdist=1 out=stdout.fa 2>> $tmp_dir/log.log | bbduk.sh -Xmx20G interleaved=auto overwrite=t in=stdin.fa out=stdout.fa ref=$Bin/resources/phix174_ill.ref.fa.gz k=31 hdist=1 2>> $tmp_dir/log.log | bbduk.sh -Xmx20G overwrite=t interleaved=auto in=stdin.fa fastawrap=10000 out=stdout.fa minlength=$min_read_length qtrim=rl maq=20 maxns=0 entropy=0.5 overwrite=t trimq=14 2>>$tmp_dir/log.log | sed 's/>/>$tmp_sample_id#/' | sed 's/ /-/g' >$input_fasta_sequences`;	
+							
+					}
+				else{			
+						my $ret=`reformat.sh in=$input_fasta_file out=stdout.fa fastawrap=0 2>>$tmp_dir/log.log | sed 's/>/>$tmp_sample_id#/' | sed 's/ /-/g' >$input_fasta_sequences`;
+					}					
+			}
+		elsif($single_fastq_file and $single_fastq_file=~/\S+/)
+			{
+				#--- supported formats: .fastq, .fq with gz
+				if($read_error_correction==1)
+					{
+						#--- check if error correction is turned on: call bbmap to do the nasty work
+						if($quiet==0)
+							{
+								print "\tCleaning $single_fastq_file\n";
+							}
+						
+						#--- run bbduk	
+						my $filtered_fastq_file="$tmp_dir/filtered_fastq.gz";
+						my $ret=`bbduk.sh -Xmx20G interleaved=auto overwrite=t in1=$single_fastq_file ref=$Bin/resources/adapters.fa ktrim=r k=23 mink=11 hdist=1 out=stdout.fq 2>> $tmp_dir/log.log | bbduk.sh -Xmx20G interleaved=auto overwrite=t in=stdin.fq out=stdout.fq ref=$Bin/resources/phix174_ill.ref.fa.gz k=31 hdist=1 2>> $tmp_dir/log.log | bbduk.sh -Xmx20G overwrite=t interleaved=auto in=stdin.fq fastawrap=10000 out=stdout.fa minlength=$min_read_length qtrim=rl maq=20 maxns=0 entropy=0.5 overwrite=t trimq=14 2>>$tmp_dir/log.log | sed 's/>/>$sample_id#/' | sed 's/ /-/g' >$input_fasta_sequences`;
+					
+						
+					}
+				elsif($single_fastq_file=~/\.gz$/)
+					{
+						#--- extract the reads and write them to the fasta sequence file
+						my $ret=`zcat $single_fastq_file | grep -B 2 '^+' | grep -v  '^+' | grep -v '^-' | sed 's/^@/>/' | sed 's/>/>$sample_id#/' | sed 's/ /-/g' >$input_fasta_sequences`;
+					}
+				else{
+						my $ret=`cat $single_fastq_file | grep -B 2 '^+' | grep -v  '^+' | grep -v '^-' | sed 's/^@/>/' | sed 's/>/>$sample_id#/' | sed 's/ /-/g' >$input_fasta_sequences`;
+					}		
+			}
+		elsif($forward_fastq_file and $forward_fastq_file=~/\S+/ and $reverse_fastq_file and $reverse_fastq_file=~/\S+/)
+			{
+				if($read_error_correction==1)
+					{
+						#--- check if error correction is turned on: call bbmap to do the nasty work
+						if($quiet==0)
+							{
+								print "\tCleaning and merging $forward_fastq_file and $reverse_fastq_file \n";
+							}
+						
+						#--- run bbduk,bbmerge and reformat	
+						my $filtered_fastq_file="$tmp_dir/filtered_fastq.gz";
+						my $ret=`bbduk.sh -Xmx20G overwrite=t in1=$forward_fastq_file in2=$reverse_fastq_file ref=$Bin/resources/adapters.fa ktrim=r k=23 mink=11 hdist=1 out=stdout.fq 2>> $tmp_dir/log.log | bbduk.sh -Xmx20G interleaved=auto overwrite=t in=stdin.fq out=stdout.fq ref=$Bin/resources/phix174_ill.ref.fa.gz k=31 hdist=1 2>> $tmp_dir/log.log | bbduk.sh -Xmx20G overwrite=t interleaved=auto in=stdin.fq fastawrap=10000 out=stdout.fq minlength=20 qtrim=rl maq=20 maxns=0 entropy=0.5 overwrite=t trimq=14 2>> $tmp_dir/log.log | bbmerge.sh interleaved=auto in=stdin.fq out=stdout.fq outu=stdout.fq 2>>$tmp_dir/log.log | reformat.sh in=stdin.fq out=stdout.fa fastawrap=0 2>>$tmp_dir/log.log | sed 's/>/>$sample_id#/' | sed 's/ /-/g' >$input_fasta_sequences`;
+					
+						#--- combine the merged and unmerged reads
+						#my $ret=`cat $tmp_dir/merged_filtered_reads.fa $tmp_dir/unmerged_filtered_reads.fa | sed 's/>/>$sample_id#/' | sed 's/ /-/g' >$input_fasta_sequences`;				
+					}
+				else{
+						if($quiet==0)
+							{
+								print "\tMerging $forward_fastq_file and $reverse_fastq_file \n";
+							}
+						#--- merge the reads
+						my $ret=`bbmerge.sh in1=$forward_fastq_file in2=$reverse_fastq_file out=stdout.fq outu=stdout.fq 2>>$tmp_dir/log.log | reformat.sh in=stdin.fq out=stdout.fa fastawrap=0 2>>$tmp_dir/log.log | sed 's/>/>$sample_id#/' | sed 's/ /-/g' >$input_fasta_sequences`;
+						
+						#--- combine the merged and unmerged reads
+						#my $ret=`cat $tmp_dir/merged_filtered_reads.fa $tmp_dir/unmerged_filtered_reads.fa | sed 's/>/>$sample_id#/' | sed 's/ /-/g' >$input_fasta_sequences`;	
+					}	
+			}
+		elsif($interleaved_fastq_file and $interleaved_fastq_file=~/\S/) #--- interleaved reads --
+			{
+				#--- supported formats: .fastq, .fq with gz
+				if($read_error_correction==1)
+					{
+						#--- check if error correction is turned on: call bbmap to do the nasty work
+						if($quiet==0)
+							{
+								print "\tCleaning and merging reads from $interleaved_fastq_file\n";
+							}
+						
+						#--- run bbduk					
+						my $ret=`bbduk.sh -Xmx20G interleaved=auto overwrite=t in1=$interleaved_fastq_file ref=$Bin/resources/adapters.fa ktrim=r k=23 mink=11 hdist=1 out=stdout.fq 2>> $tmp_dir/log.log | bbduk.sh -Xmx20G interleaved=auto overwrite=t in=stdin.fq out=stdout.fq ref=$Bin/resources/phix174_ill.ref.fa.gz k=31 hdist=1 2>> $tmp_dir/log.log | bbduk.sh -Xmx20G overwrite=t interleaved=auto in=stdin.fq fastawrap=10000 out=stdout.fq minlength=$min_read_length qtrim=rl maq=20 maxns=0 entropy=0.5 overwrite=t trimq=14 2>>$tmp_dir/log.log | bbmerge.sh interleaved=auto in1=stdin.fq out=stdout.fq outu=stdout.fq 2>>$tmp_dir/log.log | reformat.sh in=stdin.fq out=stdout.fa fastawrap=0 2>>$tmp_dir/log.log | sed 's/>/>$sample_id#/' | sed 's/ /-/g' >$input_fasta_sequences`;
+					
+						
+					}
+				elsif($interleaved_fastq_file=~/\.gz$/ or $interleaved_fastq_file=~/\.fastq$/ or $interleaved_fastq_file=~/\.fq$/)
+					{
+						if($quiet==0)
+							{
+								print "\tMerging reads from $interleaved_fastq_file\n";
+							}
+						#--- extract the reads and write them to the fasta sequence file
+						my $ret=`bbmerge.sh interleaved=auto in1=$interleaved_fastq_file out=stdout.fq outu=stdout.fq 2>>$tmp_dir/log.log | reformat.sh in=stdin.fq out=stdout.fa fastawrap=0 2>>$tmp_dir/log.log | sed 's/>/>$sample_id#/' | sed 's/ /-/g' | sed 's/>/>$sample_id#/' | sed 's/ /-/g' >$input_fasta_sequences`;
+					}
+			}
+		
+		return 1;
+	}
+
+
+
+sub handle_assembly()
+	{
+			
+		#--- first check if user has provided assembly/reference sequences 		
+		if($assembled_contigs_file and $assembled_contigs_file =~/\S/)
+			{
+				if($quiet==0)
+					{
+						print "\tProcessing $assembled_contigs_file ..\n";	#exit;	
+					}
+				#--- just make single line sequence [also make sure no gaps in the sequence headers] 
+				 my $ret=`reformat.sh in=$assembled_contigs_file out=stdout.fa fastawrap=0 2>>$tmp_dir/log.log | sed 's/>/>$sample_id#/' | sed 's/ /-/g' >$assembled_contigs`;
+			}
+		#--- do the assembly
+		elsif($assembler=~/megahit/i)
+			{
+				if($quiet==0)
+					{
+						print "\tAssembling $input_fasta_sequences to create $assembled_contigs using MEGAHIT ..\n";	#exit;	
+					}
+				#---- run megahit	
+				system("megahit -t $number_of_threads -r $input_fasta_sequences --out-dir $tmp_dir/assembly --min-contig-len 100 >>$tmp_dir/megahit.log 2>>$tmp_dir/megahit.log ");                                       
+                                                
+                 #--- now make single line sequence [also make sure no gaps in the sequence headers]
+                 my $ret=`reformat.sh in=$tmp_dir/assembly/final.contigs.fa out=stdout.fa fastawrap=0 2>>$tmp_dir/log.log | sed 's/>/>$sample_id#/' | sed 's/ /-/g' >$assembled_contigs`;
+			}
+		elsif($assembler=~/spades/i)
+			{
+				if($quiet==0)
+					{
+						print "\tAssembling $input_fasta_sequences to create $assembled_contigs using SPADES ..\n";	#exit;	
+					}
+					
+				system("spades.py -t $number_of_threads --only-assembler --careful -s $input_fasta_sequences -o $tmp_dir/assembly >>$tmp_dir/megahit.log 2>>$tmp_dir/megahit.log ");                                       
+                                                
+                 #--- now make single line sequence [also make sure no gaps in the sequence headers]
+                 my $ret=`reformat.sh in=$tmp_dir/assembly/contigs.fasta out=stdout.fa fastawrap=0 2>>$tmp_dir/log.log | sed 's/>/>$sample_id#/' | sed 's/ /-/g' >$assembled_contigs`;
+			}
+	
+		
+		return 1;
+	}
+
+
+sub subsample_reads_to_specified_number()
+	{
+		
+		#--- now randomly select the desired nof reads --
+		open(WR,">$subsampled_reads_file");
+        my $seq_count=0;
+        foreach my $read_id(shuffle keys %hash_of_readID_and_seq)
+           {
+             my $read_seq=$hash_of_readID_and_seq{$read_id};
+             
+             if(length($read_seq)< $min_read_length){next;}
+             
+             print WR ">$read_id\n$read_seq\n";                               
+                     
+             $seq_count++;
+             
+             if($seq_count >= $subsample_reads_to){last;}
+           }                
+        close(WR);
+		
+		
+		return 1;
+	}
+
+sub identify_good_repeats()
+	{
+		my($refseq_or_metagenomic,$input_crispr_file,$selected_repeat_sequences)=@_;
+		
+		#--- process the CRISPRs
+		open(RD,"$input_crispr_file");
+		my @arr_crispr_file=<RD>;
+		close(RD);
+				
+				
+		#--- now load all repeats in a hash with associated parameters
+		my %hash_of_repeat_index_and_repeat_seq_with_parameters;
+		 
+		
+		open(WR,">$selected_repeat_sequences");	
+		my $repeat_index=0;	
+		for(my $i=0;$i<=$#arr_crispr_file;$i++)
+			{
+				my $line=$arr_crispr_file[$i]; chomp $line; 						
+						
+						
+				if($line=~ /^>/)     #------ first level--------------------------------------------------------
+					{
+								
+						my $array_start_line_index=$i;
+						my @arr_current_array;
+						
+						my $is_questionable_array=0;
+						my $k=$i;
+						while($arr_crispr_file[$k]!~/\/\//)
+							{
+								#--- check to skip "# Questionable array : YES"
+								if($line=~/# Questionable array : YES/)
+									{
+										$is_questionable_array++;
+									}
+								#----	
+								push(@arr_current_array,$arr_crispr_file[$k]);
+								$k++;
+							}
+						$i=$k;
+						
+						
+						
+						#--- process the current array and get parameters --
+						if($is_questionable_array==0)
+						{
+							my($model_repeat,$array_direction,$directional_confidence,$score,$nof_repeats,$nof_perfect_repeats,$nof_mutated_repeats,$total_insertions,$total_mutations,$at_percentage_in_repeat,$at_percentage_in_spacers)=&process_array_and_load_hashes(\@arr_current_array);
+							
+							#print "$model_repeat\t$array_direction\t$directional_confidence\t$score\t$nof_repeats\t$total_insertions\t$total_mutations\t$nof_mutated_repeats\n";
+							
+							my $bad_array=0;
+							
+							if($score < 3)
+								{
+									$bad_array++;
+								}
+							if($nof_repeats < 3)
+								{
+									$bad_array++;
+								}
+							if($nof_perfect_repeats<3)
+								{
+									$bad_array++;
+								}	
+							if(length($model_repeat) < 23)
+								{
+									$bad_array++;
+								}	
+							if($total_insertions >3 and ($nof_mutated_repeats/$nof_repeats) >0.25 )
+								{
+									$bad_array++;
+								}
+							if($total_mutations > 3 and ($nof_mutated_repeats/$nof_repeats) >0.25)
+								{
+									$bad_array++;
+								}
+							#--- check overall AT/GC percentage in the CRISPR region
+							if(($at_percentage_in_repeat < 20 and $at_percentage_in_spacers <20) or ($at_percentage_in_repeat > 80 and $at_percentage_in_spacers >80))
+								{
+									$bad_array++;
+								}
+							#---- if all conditions are met, write the repeat sequence
+							if($bad_array==0)
+								{
+									$repeat_index++;
+									
+									print WR ">REPEAT_$refseq_or_metagenomic\_$repeat_index-$array_direction-$directional_confidence-$score-$nof_repeats-$total_insertions-$total_mutations-$nof_mutated_repeats\n$model_repeat\n";
+								}
+						}		
+					}	
+								
+			}
+		close(WR);
+		
+		return 1;
+	}
+
+
+sub process_array_and_load_hashes()
+	{
+		my($current_array)=@_;
+		
+		
+		#my $array_start; my $array_stop;my $array_seq="";my $crispr_index; my $left_flank=""; my $right_flank="";
+		my $model_repeat="NA";
+		my $array_direction="NA";
+		my $directional_confidence="NA";
+		my $score=0;
+		my $nof_repeats=0;			
+		my $total_insertions=0;
+		my $total_mutations=0;		
+		my $nof_mutated_repeats=0;
+		my $nof_perfect_repeats=0;
+		my $at_percentage_in_repeat=0.1;
+		my $at_percentage_in_spacers=0.1;
+		my @arr_spacers;
+		
+		for(my $i=0;$i<=$#{$current_array};$i++)
+			{
+				my $line=$$current_array[$i]; chomp $line; 						
+					
+				#---- now get the direction ------------------------------------------------------------------------------
+				if($line=~/Array_Orientation: (\S+)/)
+					{
+						$array_direction=$1; chomp $array_direction; $array_direction=~s/\r+//g;
+						my @arr_d1=split('',$array_direction); #Forward|Reverse|Unconfirmed
+						
+						$array_direction=$arr_d1[0];
+					}	
+				#--- get the representative repeat ---
+				if($line=~/# Primary repeat :     (\S+)/)
+					{
+						$model_repeat=$1; chomp $model_repeat; $model_repeat=~s/\r+//g;
+						
+						#--- calculate the AT%
+						my $nof_As=$model_repeat=~s/A/A/gi;
+						my $nof_Ts=$model_repeat=~s/T/T/gi;
+						
+						if(length($model_repeat) >0 and ($nof_As >0 or $nof_Ts >0))
+							{
+								$at_percentage_in_repeat= (($nof_As+$nof_Ts)/length($model_repeat))*100;
+							}
+					}	
+				#--- get the array score ---
+				if($line=~/# Questionable array : NO/)
+					{
+						my @arr_s1=split('\s+',$line);
+						$score=$arr_s1[$#arr_s1];
+					}
+				if($line=~/Final direction:/)		##       Final direction:         R [0,1.15   Confidence: HIGH] 
+					{
+						my @arr_s1=split('\s+',$line);
+						$directional_confidence=$arr_s1[$#arr_s1]; $directional_confidence=~s/\]//g;
+						
+					}
+				#-- now check the individual repeats							
+				if($line=~ /^>/)     
+					{		
+													
+						#---now process all the dotted repeat, and add to sequence_strand on the go
+						my $j=$i+4;
+						while($$current_array[$j]!~/====/)
+							{
+								my $current_line=$$current_array[$j]; chomp $current_line; $current_line=~s/\r+//g; $current_line=~s/^\s+//;
+										
+								my @arr_t1=split('\t',$current_line);
+										
+										my $r_start=$arr_t1[0];$r_start=~s/\s+//g;
+										
+										my $r_length=$arr_t1[1];$r_length=~s/\s+//g;
+										my $s_length=$arr_t1[3];$s_length=~s/\s+//g;
+										my $r_seq=$arr_t1[4]; $r_seq=~s/\s+//g; 
+										my $s_seq=$arr_t1[5]; $s_seq=~s/\s+//g;
+										
+										if($s_seq and $s_seq!~/^\|/)
+											{
+												push(@arr_spacers,$s_seq);
+											}
+										
+										my $comment=$arr_t1[6];		$s_length=~s/^\s+//;							
+										
+										
+										
+										
+										my $tmp_r_seq=$r_seq;
+										#--- get total mutations (includes deletions) ---
+										my $nof_mutations=0;
+										$tmp_r_seq=~s/\.//g;
+										if($tmp_r_seq and $tmp_r_seq=~/\S+/)
+											{
+												$nof_mutations=length($tmp_r_seq);
+											}
+										
+										
+												
+										#---- dont forget to check insertion bases in comment ---------------------------										
+										my $no_of_insertions=0;
+										if($arr_t1[6] and $arr_t1[6]!~/^Del/)
+											{
+												$comment=$arr_t1[6]; chomp $comment; $comment=~s/^\s+//;
+															#if($comment=~/^Del/){next;}												
+												my @tmp_arr1=split(' ',$comment);
+												my $insertion_bases=$tmp_arr1[0];
+												my $insertion_positions=$tmp_arr1[1];
+												
+												$insertion_bases=~s/,//g;
+												$no_of_insertions=length($insertion_bases);	
+												
+											}
+										
+										#---------------------------------------------------------
+										$total_mutations= $total_mutations + $nof_mutations;
+										$total_insertions=$total_insertions+$no_of_insertions;
+										
+										#--- get the nof_repeats
+										$nof_repeats++;
+										
+										#--- get the nof_mutated_repeats ----
+										if($nof_mutations >0 or $no_of_insertions >0)
+											{
+												$nof_mutated_repeats++;
+											}
+										else{
+												$nof_perfect_repeats++;
+											}	
+										
+										$j++;
+										
+										if($j>=$#{$current_array}){last;}
+									}
+								$i=$j;
+					}
+
+							
+			}
+		
+		#--- calculate the AT% in spacers --
+		if($arr_spacers[0] and $arr_spacers[0]=~/\S+/)
+			{
+				my $all_spacers=join("",@arr_spacers);
+				#--- calculate the AT%
+				my $nof_As=$all_spacers=~s/A/A/gi;
+				my $nof_Ts=$all_spacers=~s/T/T/gi;
+						
+				if(length($all_spacers) >0 and ($nof_As >0 or $nof_Ts >0))
+					{
+						$at_percentage_in_spacers= (($nof_As+$nof_Ts)/length($all_spacers))*100;
+					}
+				
+			}	
+			
+		return ($model_repeat,$array_direction,$directional_confidence,$score,$nof_repeats,$nof_perfect_repeats,$nof_mutated_repeats,$total_insertions,$total_mutations,$at_percentage_in_repeat,$at_percentage_in_spacers);
+	}
+
+
+sub process_cluster_file_and_load_hashes()
+	{
+		my($cluster_prefix,$selected_repeat_sequences,$cluster_file,$hash_of_no_of_entries_and_cluster_id,$hash_of_cluster_id_and_ordered_entries)=@_;
+		
+		#---- load seq IDs and sequences in a hash -------------------
+		my %hash_of_seq_id_and_seq;
+		my @arr_input_seq_file=`cat $selected_repeat_sequences >&1`;
+				
+		for(my $i=0;$i<$#arr_input_seq_file;$i++)
+			{
+				if($arr_input_seq_file[$i]=~/^>/)
+					{
+						my $id=$arr_input_seq_file[$i]; 	chomp $id;	$id=~s/\r//g; $id=~s/>//;
+						my $seq=$arr_input_seq_file[$i+1];	chomp $seq;	$seq=~s/\r//g;
+								
+						$hash_of_seq_id_and_seq{$id}=$seq;
+					}
+			}	
+
+
+		#---- now process the cluster file
+		my @arr_clstr_file=`cat $selected_repeat_sequences.NR.clstr >&1`;
+		
+		
+		my $cluster_index=0;
+		#open(SINGLE,">$output_seq_file.single");		
+		for(my $i=0;$i<$#arr_clstr_file;$i++)
+			{
+				my $c_line=$arr_clstr_file[$i];
+				
+				if($c_line=~/>Cluster/)
+					{							
+							
+							
+							# if identify_cluster_direction_from_the_sequence_header is 1; identify the optimal direction for the entire cluster
+							my $optimal_cluster_direction="plus";
+							if($identify_cluster_direction_from_the_sequence_header==1 or $identify_cluster_direction_using_majority_rule==1)
+								{
+									#--- load the lines belongs to this cluster and get the direction
+									my $c=$i+1;
+									my $no_of_seqs_in_cluster=0;
+									
+									
+															
+									my %hash_cluster_lines;
+									my %hash_of_current_seqIDs;
+									while($arr_clstr_file[$c] !~ />Cluster/)
+										{
+											my $current_line=$arr_clstr_file[$c]; chomp $current_line;$current_line=~s/\r//g;
+											
+											
+											#--- get the rep_seq for this cluster --------------
+											if($current_line=~/>/)
+												{									
+													
+													my @arr_t1=split('>',$current_line);
+													my @arr_t2=split('\.\.\.',$arr_t1[$#arr_t1]);											
+													my $seq_id=$arr_t2[0];
+													
+													$hash_of_current_seqIDs{$seq_id}=1;
+													
+													$hash_cluster_lines{$current_line}=1;											
+													$no_of_seqs_in_cluster++;
+												}
+											$c++;
+											
+											if($c > $#arr_clstr_file){last;}									
+										}
+									
+									
+									if($no_of_seqs_in_cluster < $min_no_of_seq_in_a_cluster) #-- as the clusters with just 2 sequences (one with HIGH confidence) will work
+										{
+											#--- write the leftover repeat in the single file
+											#foreach my $seq_id(keys %hash_temp_seq_id_and_seq)
+											#	{
+											#		my $seq=$hash_of_seq_id_and_seq{$seq_id};	
+											#		print SINGLE ">$seq_id\n$seq\n";
+											#	}
+											
+											next;
+										}
+									
+									#------
+									if($no_of_seqs_in_cluster >=2 && $identify_cluster_direction_from_the_sequence_header==1) #-- as the clusters with just 2 sequences (one with HIGH confidence) will work
+										{
+											($optimal_cluster_direction)=&get_optimal_cluster_direction_from_the_sequence_header($optimal_cluster_direction,\%hash_cluster_lines);
+											
+											#if($optimal_cluster_direction eq "minus")
+											#	{
+													#print "All sequences from this cluster will be changed to $optimal_cluster_direction\n";
+													#foreach my $l(keys %hash_cluster_lines)
+													#	{
+													#		print "$l\n";
+													#	}
+											#	}
+										}
+									elsif($no_of_seqs_in_cluster >=3 && $identify_cluster_direction_using_majority_rule==1)
+										{
+											($optimal_cluster_direction)=&get_optimal_cluster_direction_using_majority_rule($optimal_cluster_direction,\%hash_cluster_lines);
+											
+											#if($optimal_cluster_direction eq "minus")
+											#	{
+											#		#print "All sequences from this cluster [ $c_line ] will be changed to $optimal_cluster_direction\n";
+											#	}
+										}
+										
+										
+								}
+							
+							#---- get no. of sequences in the cluster ---
+							my $c=$i+1;
+							my $no_of_seqs_in_cluster=0;
+							
+							my $rep_seq_id="";
+							my $rep_seq="";
+							
+							my %hash_temp_seq_id_and_seq;
+							while($arr_clstr_file[$c]!~/>Cluster/)
+								{
+									my $current_line=$arr_clstr_file[$c]; chomp $current_line;$current_line=~s/\r//g;
+									
+									
+									#--- get the rep_seq for this cluster --------------
+									if($current_line=~/>/)
+										{									
+											
+											my @arr_t1=split('>',$current_line);
+											my @arr_t2=split('\.\.\.',$arr_t1[$#arr_t1]);
+											
+											my $seq_id=$arr_t2[0];
+											my $seq=$hash_of_seq_id_and_seq{$seq_id};									
+											
+											
+											
+											#---find the strand ---
+											my $strand="plus";
+											if($current_line=~/ -\//)
+												{
+													$strand='minus';
+												}	
+											
+											#---- compare the current strand against the optimal direction
+											if($strand ne $optimal_cluster_direction)
+												{
+													$seq=reverse($seq);$seq=~tr/ACGT/TGCA/;
+												}
+												
+											if($current_line=~/ \*/)
+												{
+													$rep_seq_id=$seq_id;
+													$rep_seq=$seq;
+												}
+											else{
+													$hash_temp_seq_id_and_seq{$seq_id}=$seq;
+												}		
+																						
+											#print "\t$seq\t[Direction: $strand]\n";									
+										}
+									#---------------------------------------------------
+									if($current_line=~/>/)
+										{
+											$no_of_seqs_in_cluster++;
+										}
+									$c++;
+									
+									if($c > $#arr_clstr_file){last;}	
+									
+								}
+							
+											
+
+							#----------------------------------------------------------------	
+							
+							
+							#my $cluster_id="CLUSTER_".$cluster_index;
+							$cluster_index++;
+							my $cluster_id=$cluster_index;
+							
+							$hash_of_no_of_entries_and_cluster_id->{$no_of_seqs_in_cluster}->{$cluster_id}=length($rep_seq);
+							
+							#--- first load the rep_seq_id and seq -----
+							$hash_of_cluster_id_and_ordered_entries->{$cluster_id}->{'0'}="$rep_seq_id|$rep_seq";
+							
+							#---- now load the sequences that belong to this cluster in a hash
+							my $seq_index=1;
+							foreach my $seq_id(sort{length($hash_temp_seq_id_and_seq{$b})<=>length($hash_temp_seq_id_and_seq{$a})} keys %hash_temp_seq_id_and_seq)
+								{
+									my $t_seq=$hash_temp_seq_id_and_seq{$seq_id};
+									$hash_of_cluster_id_and_ordered_entries->{$cluster_id}->{$seq_index}="$seq_id|$t_seq";
+									
+									#print ">$seq_id\n$t_seq\n";
+									$seq_index++;
+								}
+
+					}
+				
+			}	
+		#close(SINGLE);
+
+
+
+
+	
+		
+		return 1;
+	}
+
+
+
+
+sub get_optimal_cluster_direction_from_the_sequence_header()
+	{
+		my($optimal_cluster_direction,$hash_cluster_lines)=@_;
+		
+		#--- load the sensitivity values --
+		my %hash_of_sensitivity_values;
+		$hash_of_sensitivity_values{'HIGH'}=0.75;
+		$hash_of_sensitivity_values{'MEDIUM'}=0.50;
+		$hash_of_sensitivity_values{'LOW'}=0.25;
+		
+		
+		#----
+		my %hash_of_directions;
+		
+		
+		my $line_index=1;
+		foreach my $current_line(keys %{$hash_cluster_lines})
+			{
+				my @arr_t1=split('>',$current_line);
+				
+				my @arr_t2=split('\.\.\.',$arr_t1[$#arr_t1]);
+									
+				my $seq_id=$arr_t2[0];
+									
+				#----					
+									
+				
+				#---find the strand ---
+				my $strand="plus";
+				if($current_line=~/ \*/)
+					{
+						$strand="plus";
+					}
+				if($current_line=~/ -\//)
+					{
+						$strand='minus';
+				
+					}
+				#----	
+				my $prediction_sensitivity="NA";
+				if($current_line=~m/-(HIGH|MEDIUM|LOW|NA)-/) # >REPEAT_90600-R-HIGH-5.86-5-0-3-2
+					{						
+						$prediction_sensitivity=$1;
+					}
+				
+				#--- get the score 
+				my $sensitivity_score_for_this_direction=0;
+				if($hash_of_sensitivity_values{$prediction_sensitivity})
+					{
+						$sensitivity_score_for_this_direction=$hash_of_sensitivity_values{$prediction_sensitivity};
+					}
+				
+					
+				if($hash_of_directions{$strand})
+					{	
+						$hash_of_directions{$strand}=$hash_of_directions{$strand}+$sensitivity_score_for_this_direction;	
+					}
+				else{
+						$hash_of_directions{$strand}=$sensitivity_score_for_this_direction;
+					}
+						
+				$line_index++;	
+			}
+		
+		#-- now check which direction is higher
+		if($hash_of_directions{'minus'} and $hash_of_directions{'minus'} >$hash_of_directions{'plus'})
+			{
+				$optimal_cluster_direction="minus";
+			}
+		else{
+				$optimal_cluster_direction="plus";
+			}	
+		
+		return ($optimal_cluster_direction);
+	}
+
+
+sub split_input_sequences_into_n_files()
+	{
+		my($pm,$arr_splitted_sequence_files)=@_;
+		
+		
+		#my $temp_seq_file="$tmp_dir/temp_seq.fa";
+		
+		##--- check if the input file is compressed fastq/fq file 
+		#if($input_fasta_file=~/\.fastq\.gz$/ or $input_fasta_file=~/\.fq\.gz$/)
+		#	{
+		#		#--- read the sequence
+		#		my $ret=`zcat $input_fasta_file | grep -B 2 '^+' | grep -v -E '^-' | grep -v '^+' | sed 's/^@/>/' >$temp_seq_file`;				
+		#	}
+		#elsif($input_fasta_file=~/\.fastq$/ or $input_fasta_file=~/\.fq$/)
+		#	{
+		#		#--- read the sequence
+		#		my $ret=`cat $input_fasta_file | grep -B 2 '^+' | grep -v -E '^-' | grep -v '^+' | sed 's/^@/>/' >$temp_seq_file`;				
+		#	}
+		#---check for compressed fasta file	
+		#elsif($input_fasta_file=~/\.fna\.gz$/ or $input_fasta_file=~/\.fa\.gz$/)
+		#	{
+		#		my $ret=`zcat $input_fasta_file >$temp_seq_file`;
+		#	}
+		#--- else just normal fasta file	
+		#elsif($input_fasta_file=~/\.fna$/ or $input_fasta_file=~/\.fa$/ or $input_fasta_file=~/\.fasta$/)
+		#	{
+		#		$temp_seq_file=$input_fasta_file;
+		#	}		
+		
+		
+		################ load the sequence in hash
+		
+		&load_seqID_seq_and_original_seq_header_in_hash($input_fasta_sequences,\%hash_of_read_id_and_seq,\%hash_of_simplified_read_id_and_original_read_id);
+		
+		
+		
+		
+		
+		
+		
+		#---- get total sequence count -----------
+		my $total_sequences=keys %hash_of_read_id_and_seq;  if($total_sequences<0){print "Error: The input file doesn't contain any sequences..\n";exit;}
+		
+		my $nof_sequences_in_each_file=sprintf("%.0f",(($total_sequences+1)/$number_of_threads)); $nof_sequences_in_each_file=int($nof_sequences_in_each_file);
+		
+		if($nof_sequences_in_each_file<1){$nof_sequences_in_each_file=1;}
+		#print "\$total_sequences=$total_sequences \t\$nof_sequences_in_each_file=$nof_sequences_in_each_file\n";
+		#$nof_sequences_in_each_file=500;
+		
+		#---- write to the output file -----------
+		my $part_index=1;		
+		my $part_file_name="";
+		my @arr_part_files;
+		$part_file_name="$tmp_dir/splitted_part_$part_index.fa"; push(@arr_part_files,$part_file_name);
+		open(WR,">$part_file_name");
+		
+		my $sequence_index=0;
+		my $sequences_written=0;
+		#foreach my $seq_id(sort{$hash_of_read_id_and_seq_length{$b}<=>$hash_of_read_id_and_seq_length{$a}} keys %hash_of_read_id_and_seq_length)
+		foreach my $seq_id(keys %hash_of_read_id_and_seq)
+			{
+				my $seq=$hash_of_read_id_and_seq{$seq_id};
+				print WR ">$seq_id\n$seq\n";
+				
+				$sequence_index++;
+				$sequences_written++;
+				
+				if($sequence_index >= $nof_sequences_in_each_file and $sequences_written<$total_sequences)
+					{
+						close(WR);
+						$sequence_index=0;
+						
+						#--- now start a new file ------
+						$part_index++;
+						$part_file_name="$tmp_dir/splitted_part_$part_index.fa"; push(@arr_part_files,$part_file_name);
+						open(WR,">$part_file_name");						
+					}				
+			}
+		close(WR);	
+		#print "The non-redundant sequences are in file: $output_seq_file_prefix\n";
+		
+		foreach my $file(@arr_part_files)
+			{
+				push(@$arr_splitted_sequence_files,$file);
+			}
+		
+		return 1;
+	}
+
+
+sub identify_reads_with_at_least_one_and_half_repeat_match()
+	{
+		my($input_reads_file,$blast_output_file,$selected_reads_file,$hash_of_qryIDs_with_atleast_one_good_hit)=@_;
+		
+		#----- load the good reference seqID and sequence in a hash
+		#my %hash_of_ref_repeat_seqID_and_seq;
+		#&load_seqID_and_seq_in_hash($reference_repeatDB,\%hash_of_ref_repeat_seqID_and_seq);
+		
+		my %hash_of_read_seqID_and_seq;
+		&load_seqID_and_seq_in_hash($input_reads_file,\%hash_of_read_seqID_and_seq);
+		
+		#--- now identify the reads ---
+		open(RD,"$blast_output_file");
+		while(my $row=<RD>)
+			{
+				#if($row !~/^REPEAT_/){next;}
+
+				chomp $row; $row=~s/\r//;
+
+				my @arr_r1=split('\t',$row);
+				my $refID=$arr_r1[0];
+
+
+							
+				#-----
+				my $qryID=$arr_r1[4];
+				my $aligned_overlap_start=$arr_r1[5];
+				my $aligned_overlap_stop=$arr_r1[6];
+				my $direction=$arr_r1[7];
+
+				my $overlap_length=$arr_r1[8];
+				my $overlap_identity=$arr_r1[14];
+
+
+				my $ref_length=$arr_r1[$#arr_r1-1];
+				my $qry_length=$arr_r1[$#arr_r1];
+
+				#--- calculate the ref_coverage
+				my $ref_coverage=int(($overlap_length/$ref_length)*100);
+
+
+				if(not $hash_of_qryIDs_with_atleast_one_good_hit->{$qryID} and $ref_coverage < 90)
+					{
+						#print "$row\n";
+						next;
+					}
+				elsif($hash_of_qryIDs_with_atleast_one_good_hit->{$qryID} and $ref_coverage < 33)
+					{
+						next;
+					}
+				
+				
+				if($hash_of_qryIDs_with_atleast_one_good_hit->{$qryID})
+					{
+						$hash_of_qryIDs_with_atleast_one_good_hit->{$qryID}=$hash_of_qryIDs_with_atleast_one_good_hit->{$qryID}+1;
+					}
+				else{		
+						$hash_of_qryIDs_with_atleast_one_good_hit->{$qryID}=1;						
+					}
+						
+			}
+		close(RD);
+		
+		
+		#--- now write the qryID and sequences
+				
+		open(WR,">$selected_reads_file");		
+		foreach my $qryID(keys %{$hash_of_qryIDs_with_atleast_one_good_hit})
+			{
+				if($hash_of_qryIDs_with_atleast_one_good_hit->{$qryID} < 2)
+					{
+						next;
+					}
+				print WR ">$qryID\n$hash_of_read_seqID_and_seq{$qryID}\n";						
+			}
+		close(WR);
+		
+		return 1;
+	}
+
+
+
+sub generate_crisprs()
+	{
+		my($blast_output_file,$selected_reads_file,$crispr_detect_output,$questionable_crispr_containing_reads,$hash_of_selected_readID_and_seq,$hash_of_readIDs_needed_to_be_analyzed_with_full_crispr_detect)=@_;
+		
+		
+		
+		###################### process the blast output and load putative-CRISPR records -----		
+		my %hash_of_qryID_and_overlapping_regions;
+		my %hash_of_qryID_refID_and_direction;
+		my %hash_of_qryID_start_and_repeat;
+		
+		my %hash_of_qryID_start_and_insertions;
+				
+		open(RD,"$blast_output_file");
+		while(my $row=<RD>)
+			{
+				
+			#if($row !~/^REPEAT_/){next;}
+
+			chomp $row; $row=~s/\r//;
+
+			my @arr_r1=split('\t',$row);
+			
+			my $refID=$arr_r1[0];
+			my $ref_start=$arr_r1[2];
+			my $ref_stop=$arr_r1[3];
+			
+			my $qryID=$arr_r1[4];			
+			my $qry_start=$arr_r1[5];
+			my $qry_stop=$arr_r1[6];
+
+			my $direction=$arr_r1[7];
+
+			my $ref_overlapping_region=$arr_r1[12]; 
+			my $original_ref_overlapping_region=$ref_overlapping_region; #---- a backup of the ref_overlapping_region; needed for checking bas(s) insertions
+			#$ref_overlapping_region=~s/-//g;
+			my $qry_overlapping_region=$arr_r1[13];
+
+
+			#-------
+			if(not $hash_of_selected_readID_and_seq->{$qryID})
+				{
+					#print "Error finding $qryID in hash\n";
+					next;
+				}
+				
+			##--- get the ref sequence and extend to full length
+			my $matching_reference_repeat=$hash_of_ref_repeat_seqID_and_seq{$refID};
+			my $matching_reference_repeat_rc=reverse($matching_reference_repeat); $matching_reference_repeat_rc=~tr/ACGT/TGCA/;
+
+			if($direction eq 'minus')
+				{
+					$matching_reference_repeat=$matching_reference_repeat_rc;
+				}
+			#---- get the qry_seq
+			my $qry_seq=$hash_of_selected_readID_and_seq->{$qryID};
+			
+			
+			
+			########--- check to avoid hit with existing records ()
+			my $overlap_found=0;
+						
+			if($hash_of_qryID_and_overlapping_regions{$qryID})
+				{
+					foreach my $ex_start_and_stop(keys %{$hash_of_qryID_and_overlapping_regions{$qryID}})
+						{
+							my ($ex_start,$ex_stop)=split('-',$ex_start_and_stop);
+										
+							if($ex_start >= $qry_start and $ex_start <= $qry_stop)
+								{
+									$overlap_found++;										
+								}
+							if($ex_stop >= $qry_start and $ex_stop <= $qry_stop)
+								{
+									$overlap_found++;										
+								}										
+							if($qry_start >= $ex_start and $qry_start <=  $ex_stop)
+								{
+									$overlap_found++;										
+								}
+							if($qry_stop >= $ex_start and $qry_stop <=  $ex_stop)
+								{
+									$overlap_found++;										
+								}	
+											
+							#--- if overlap found then get the old score ----	
+							if($overlap_found >0)
+								{												
+									last;
+								}
+												
+						}
+				}
+				
+			if($overlap_found >0)
+				{
+					next;
+				}
+			
+			######## Case 1: the length of $qry_overlapping_region == length($matching_reference_repeat)
+			my $new_qry_start=	$qry_start;
+			my $new_qry_stop=	$qry_start + length($matching_reference_repeat);
+			my $current_crispr_repeat=$qry_overlapping_region;
+			
+			######## Case 2: the length of $qry_overlapping_region !=  length($matching_reference_repeat)	
+			if(length($qry_overlapping_region) != length($matching_reference_repeat))
+				{
+					$current_crispr_repeat=$qry_overlapping_region;
+					$new_qry_start=	$qry_start;
+					$new_qry_stop =	$qry_start + length($matching_reference_repeat);
+					
+					($new_qry_start,$new_qry_stop,$current_crispr_repeat)=&get_repeat_start_and_repeat_sequence($matching_reference_repeat,$ref_overlapping_region,$qry_seq,$qry_start,$qry_stop,$qry_overlapping_region,$new_qry_start,$new_qry_stop,$current_crispr_repeat);
+				}
+			
+			
+			my $range="$new_qry_start-$new_qry_stop";
+			
+			#print "$qryID\t$range\t$current_crispr_repeat\n";
+			
+			###################--- check for insertion(s) :::: Note, do not move this block above, as this needed to be performed just before storing the records
+			my $insertion_det="NA";
+			if($ref_overlapping_region=~/-/)
+				{
+					my @arr_ins_bases;
+					my @arr_ins_positions;
+					
+					my @arr_qor=split('',$qry_overlapping_region);
+					my @arr_ror=split('',$ref_overlapping_region);
+					for(my $i=0;$i<=$#arr_ror;$i++)
+						{
+							if($arr_ror[$i] eq "-")
+								{
+									my $ins_base=$arr_qor[$i];
+									my $ins_pos=$qry_start+$i;
+									
+									
+									push(@arr_ins_bases,$ins_base);
+									push(@arr_ins_positions,$ins_pos);	
+									
+									#-- delete the base from the @arr_qor	
+									$arr_qor[$i]="";							
+								}
+						}
+					my $b=join(",",@arr_ins_bases);	
+					my $p=join(",",@arr_ins_positions);	
+					
+					$insertion_det="$b [$p]";
+					#print "\n$insertion_det\n";
+					
+					#--- recreate the current_crispr_repeat	
+					$current_crispr_repeat=join("",@arr_qor);
+				}
+				
+				
+			#--- get the repeat sequence --
+			$hash_of_qryID_and_overlapping_regions{$qryID}{$range}=1;
+			
+			$hash_of_qryID_refID_and_direction{$qryID}="$refID|$matching_reference_repeat|$direction";			
+			$hash_of_qryID_start_and_repeat{$qryID}{$new_qry_start}=$current_crispr_repeat;
+			
+			$hash_of_qryID_start_and_insertions{$qryID}{$new_qry_start}=$insertion_det;
+			
+				
+
+		}
+		close(RD);
+		
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	#############################--- now process the putative CRISPRs --
+	my %hash_of_qryID_start_and_spacer;
+	my %hash_of_questionable_crispr_containing_readIDs;
+	
+	open(CRISPR,">$crispr_detect_output");
+	open(FP,">$crispr_detect_output.fp");
+	foreach my $qryID(keys %hash_of_qryID_start_and_repeat)
+		{
+			my $qry_seq=$hash_of_selected_readID_and_seq->{$qryID};
+			
+			my($refID,$matching_reference_repeat,$direction)=split('\|',$hash_of_qryID_refID_and_direction{$qryID});
+			
+			
+			#--- get the start positions
+			my @arr_repeat_start_positions;
+			foreach my $start(sort{$a<=>$b} keys %{$hash_of_qryID_start_and_repeat{$qryID}})
+				{
+					push(@arr_repeat_start_positions,$start);								
+				}
+			
+			##########################--- check if there are partial repeat in the left flank
+			if($arr_repeat_start_positions[0] >length($matching_reference_repeat)/2) #--- this module doesn't handle gaps; so don't try to fix gaps here -
+				{
+					#----- check if the repeat start position is >1000 ; this check will make sure occational large sequence related error
+					my $left_flank="";
+					my $lb=0;
+					if($arr_repeat_start_positions[0] >100)
+						{
+							$lb=$arr_repeat_start_positions[0]-100;
+							$left_flank=substr($qry_seq,$lb,100);
+						}
+					else{
+							$left_flank=substr($qry_seq,0,$arr_repeat_start_positions[0]-1);
+						}
+					
+					
+					
+					
+					
+					#print "$left_flank,$lb,$arr_repeat_start_positions[0]-1\n";#water -asequence=asis:$matching_reference_repeat -bsequence=asis:$left_flank -gapopen=50 -gapextend=0.5 -stdout -auto -aformat3 markx1 \n";
+					my @overlaps=`water -asequence=asis:$matching_reference_repeat -bsequence=asis:$left_flank -gapopen=50 -gapextend=0.5 -stdout -auto -aformat3 markx1 |  grep -v '^#' | grep 'asis' | awk -F ' ' '{print \$2}' >&1`;
+					
+					if($overlaps[0] and $overlaps[0]=~/\S+/)
+						{
+							my $ref_overlapping_region=$overlaps[0]; chomp $ref_overlapping_region; $ref_overlapping_region=~s/\r//;
+							my $qry_overlapping_region=$overlaps[1]; chomp $qry_overlapping_region; $qry_overlapping_region=~s/\r//;
+							
+							my $gapless_qry_overlapping_region=$qry_overlapping_region; $gapless_qry_overlapping_region=~s/-//g;
+							
+							#-- get the qry_start and stop
+							my $qry_start;
+							my $qry_stop;
+							if($left_flank=~/$gapless_qry_overlapping_region/)
+								{
+									$qry_start=$-[0];
+									$qry_stop =$+[0];
+								}
+							my $current_crispr_repeat=$qry_overlapping_region;
+							my $new_qry_start=	$qry_start;
+							my $new_qry_stop =	$qry_start + length($matching_reference_repeat);
+					
+							($new_qry_start,$new_qry_stop,$current_crispr_repeat)=&get_repeat_start_and_repeat_sequence($matching_reference_repeat,$ref_overlapping_region,$left_flank,$qry_start,$qry_stop,$qry_overlapping_region,$new_qry_start,$new_qry_stop,$current_crispr_repeat);
+							
+							
+							#--- before adding the record check that the newly identified sequence has >=60% identity to the reference sequence
+							my $gapless_c_r=$current_crispr_repeat; $gapless_c_r=~s/-//g;
+							my $identity_line=`needle -asequence=asis:$matching_reference_repeat -bsequence=asis:$gapless_c_r -stdout -auto -aformat3 markx1 |  grep '# Identity:' >&1`; # Identity:       9/9 (100.0%)
+									
+														
+							if($identity_line and $identity_line=~/\%/ )
+								{
+									chomp $identity_line; $identity_line=~s/\r//; 	$identity_line=~s/\(//g; $identity_line=~s/\)//g; $identity_line=~s/\%//g;	$identity_line=~s/\// /g;
+							
+									my @arr_l1=split(" ",$identity_line);
+									
+									my $t_identity=$arr_l1[$#arr_l1];
+									my $nof_bases_matched=$arr_l1[$#arr_l1-2];
+									if($t_identity >=90)
+										{
+											unshift(@arr_repeat_start_positions,$new_qry_start);
+											$hash_of_qryID_start_and_repeat{$qryID}{$new_qry_start}=$current_crispr_repeat;
+										}										
+								}
+							##--- store the record in the hash
+							#unshift(@arr_repeat_start_positions,$new_qry_start);
+							#$hash_of_qryID_start_and_repeat{$qryID}{$new_qry_start}=$current_crispr_repeat;
+						}
+				} 
+			
+			############################--- check if there are partial repeat in the right flank
+			if($arr_repeat_start_positions[$#arr_repeat_start_positions] + length($matching_reference_repeat) < length($qry_seq))
+				{
+					my $right_flank="";
+					my $ub=length($qry_seq) - ($arr_repeat_start_positions[$#arr_repeat_start_positions]+length($matching_reference_repeat));
+					if( length($qry_seq) - ($arr_repeat_start_positions[$#arr_repeat_start_positions] + length($matching_reference_repeat)) >100)
+						{
+							$ub=100;
+							$right_flank=substr($qry_seq,$arr_repeat_start_positions[$#arr_repeat_start_positions]+length($matching_reference_repeat)-1,$ub); #--- take 100 bases from right
+						}
+					else{
+							$right_flank=substr($qry_seq,$arr_repeat_start_positions[$#arr_repeat_start_positions]+length($matching_reference_repeat)-1,); #--- take all the remaining bases
+						}	
+										
+					my @overlaps=`water -asequence=asis:$matching_reference_repeat -bsequence=asis:$right_flank -gapopen=50 -gapextend=0.5 -stdout -auto -aformat3 markx1 |  grep -v '^#' | grep 'asis' | awk -F ' ' '{print \$2}' >&1`;
+					
+					if($overlaps[0] and $overlaps[0]=~/\S+/)
+						{
+							my $ref_overlapping_region=$overlaps[0]; chomp $ref_overlapping_region; $ref_overlapping_region=~s/\r//;
+							my $qry_overlapping_region=$overlaps[1]; chomp $qry_overlapping_region; $qry_overlapping_region=~s/\r//;
+							
+							
+							my $gapless_qry_overlapping_region=$qry_overlapping_region; $gapless_qry_overlapping_region=~s/-//g;
+							#-- get the qry_start and stop
+							my $qry_start;
+							my $qry_stop;
+							if($right_flank=~/$gapless_qry_overlapping_region/)
+								{
+									$qry_start=$arr_repeat_start_positions[$#arr_repeat_start_positions] + length($matching_reference_repeat) + $-[0];
+									$qry_stop =$qry_start + length($gapless_qry_overlapping_region);
+								}
+							my $current_crispr_repeat=$qry_overlapping_region;
+							my $new_qry_start=	$qry_start;
+							my $new_qry_stop =	$qry_start + $+[0]; #length($matching_reference_repeat);
+					
+							($new_qry_start,$new_qry_stop,$current_crispr_repeat)=&get_repeat_start_and_repeat_sequence($matching_reference_repeat,$ref_overlapping_region,$right_flank,$qry_start,$qry_stop,$qry_overlapping_region,$new_qry_start,$new_qry_stop,$current_crispr_repeat);
+							
+							#--- before adding the record check that the newly identified sequence has >=60% identity to the reference sequence
+							my $gapless_c_r=$current_crispr_repeat; $gapless_c_r=~s/-//g;
+							my $identity_line=`needle -asequence=asis:$matching_reference_repeat -bsequence=asis:$gapless_c_r -stdout -auto -aformat3 markx1 |  grep '# Identity:' >&1`; # Identity:       9/9 (100.0%)
+							
+							if($identity_line and $identity_line=~/\%/)
+								{
+									chomp $identity_line; $identity_line=~s/\r//; 
+									$identity_line=~s/\(//g; $identity_line=~s/\)//g; 
+									$identity_line=~s/\%//g;
+									$identity_line=~s/\// /g;
+									
+									my @arr_l1=split(" ",$identity_line);
+									
+									my $t_identity=$arr_l1[$#arr_l1];
+									my $nof_bases_matched=$arr_l1[$#arr_l1-2];
+									
+									if($t_identity >=80)
+										{
+											push(@arr_repeat_start_positions,$new_qry_start);
+											$hash_of_qryID_start_and_repeat{$qryID}{$new_qry_start}=$current_crispr_repeat;
+										}
+								}
+						}
+				}
+			
+			
+			
+			#--- get the spacers ---------
+			my $questionable_array=0;
+			my %hash_of_repeat_and_count;
+			my $total_insertions_in_crispr=0;
+			for(my $i=0;$i< $#arr_repeat_start_positions;$i++)
+				{
+					my $c_start=$arr_repeat_start_positions[$i];								
+					my $c_repeat=$hash_of_qryID_start_and_repeat{$qryID}{$c_start};
+					
+					
+					if($hash_of_repeat_and_count{$c_repeat})
+						{
+							$hash_of_repeat_and_count{$c_repeat}=$hash_of_repeat_and_count{$c_repeat}+1;
+						}
+					else{
+							$hash_of_repeat_and_count{$c_repeat}=1;
+						}	
+								
+					#-- remove gaps from c_repeat
+					my $gapless_c_repeat=$c_repeat;
+					if($c_repeat=~/-/)
+						{
+							$gapless_c_repeat=~s/-+//g;
+						}
+					#--- get nof_insertions --
+					
+					my $nof_insertions=0;
+					if($hash_of_qryID_start_and_insertions{$qryID}{$c_start} and $hash_of_qryID_start_and_insertions{$qryID}{$c_start} ne "NA")
+						{
+							my($bases,$positions)=split(" ",$hash_of_qryID_start_and_insertions{$qryID}{$c_start});
+							$nof_insertions=$bases=~s/,/,/g;
+							$nof_insertions=$nof_insertions+1; #--- as there might be just one base insertion in which case there won't be any comma
+						}	
+					$total_insertions_in_crispr=$total_insertions_in_crispr+$nof_insertions;	
+					#-----	
+					my $c_stop=$c_start-1 + length($gapless_c_repeat) + $nof_insertions;
+								
+					my $n_start=$arr_repeat_start_positions[$i+1];
+					my $spacer_length=$n_start-1-$c_stop;
+								
+					if($spacer_length >75)
+						{
+							#--- it seems, either the spacer contains a mutated repeat or the entire CRISPR is bad
+							$questionable_array++;
+							$hash_of_questionable_crispr_containing_readIDs{$qryID}=1;
+							
+							last;
+						}
+					
+					#---- get the spacer
+					my $c_spacer=substr($qry_seq,$c_stop,$spacer_length);
+					my $spacer_start=$c_stop;
+					my $spacer_stop=$c_stop+$spacer_length;			
+					
+					#--- store the current spacer
+					$hash_of_qryID_start_and_spacer{$qryID}{$c_start}=$c_spacer;
+								
+					#--- store the last spacer as "|"
+							
+					if($i+1 == $#arr_repeat_start_positions)
+						{
+							my $n_spacer="|";
+							$hash_of_qryID_start_and_spacer{$qryID}{$n_start}=$n_spacer;
+						}
+														
+				}
+			
+			#---- if the sequence flagged as questionable then process it separately with CRISPRDetect ---
+			if($questionable_array>0)
+				{
+					$hash_of_readIDs_needed_to_be_analyzed_with_full_crispr_detect->{$qryID}=1;
+					next;
+				}
+			#print "$qryID\n";
+			
+			
+			#########--- get the model_repeat [representative repeat] using the following rules
+			#--------------1: the repeat with the highest count wins
+			#--------------2: if multiple repeats with the same count exist, then  
+			#---------------2.1 the repeat with fewer mismatches to the reference repeat wins 
+			
+			my $model_repeat=&get_model_repeat($matching_reference_repeat,\%hash_of_repeat_and_count);
+			if(not $model_repeat or $model_repeat!~/\S/)
+				{
+					$model_repeat=$matching_reference_repeat;
+				}
+			
+			################## now create the @current_array [in CRISPRDetect format]
+			my @current_array;
+			
+			push(@current_array,">$qryID");
+			push(@current_array,"");
+			push(@current_array,"Position\tRepeat\tSpacer\tComment");
+			push(@current_array,"========\t======\t======\t=======");
+			
+			#--- store the repeat and spacer rows in an array
+			my @arr_repeat_spacer_rows;	
+			my @arr_repeats;
+			my @arr_spacers;
+			my $longest_spacer_length=0;		
+			foreach my $start(sort{$a<=>$b} keys %{$hash_of_qryID_start_and_repeat{$qryID}})
+				{
+					#--- now convert the repeat into dotted repeat
+					my $c_repeat=$hash_of_qryID_start_and_repeat{$qryID}{$start};
+					push(@arr_repeats,$c_repeat);
+					
+					my($dotted_c_repeat)=&change_bases_to_dots($c_repeat,$model_repeat);
+					if($hash_of_qryID_start_and_spacer{$qryID}{$start} and $hash_of_qryID_start_and_spacer{$qryID}{$start}=~/\S+/)
+						{						
+							my $c_spacer=$hash_of_qryID_start_and_spacer{$qryID}{$start};
+							
+							if(length($c_spacer)>$longest_spacer_length)
+								{
+									$longest_spacer_length=length($c_spacer);
+								}
+							my $comment=" ";
+							if($hash_of_qryID_start_and_insertions{$qryID}{$start} and $hash_of_qryID_start_and_insertions{$qryID}{$start} ne "NA")
+								{
+									$comment=$hash_of_qryID_start_and_insertions{$qryID}{$start};
+								}
+									
+							#---
+							my $c_row="$start\t$dotted_c_repeat\t$c_spacer\t$comment";
+							push(@current_array,$c_row);
+							
+							#print "$c_row\n";
+						}
+				}			
+			push(@current_array,"========\t======\t======\t=======");
+			
+			
+			if($#arr_repeats <1)
+				{
+					$hash_of_readIDs_needed_to_be_analyzed_with_full_crispr_detect->{$qryID}=1;
+					
+					next;
+				}
+			#print "$qryID\n";
+			
+			########  Check for insertion in the model_repeat			
+			if($model_repeat=~/-/)
+				{									
+					my $case_found=0;
+					($model_repeat,$case_found)=&fix_arrays_with_gaps_in_model_repeat_repeat($model_repeat,\@current_array);
+											
+				}
+			
+			
+			######## check if there are upto 3 gaps at the end of repeats [Skipped it, as CRISPRDetect handles it best]
+			#my $gaps_detected_in_repeat_edges=0;
+			#my $max_gap_length=0;
+			#for(my $k1=4;$k1<=$#current_array-1;$k1++)
+			#	{							
+			#		my $current_line=$current_array[$k1]; 
+			#		chomp $current_line; $current_line=~s/\r+//g; $current_line=~s/^\s+//;#$current_line=~s/\s+/\s/g;
+			#							
+			#		my($c_start,$c_repeat,$c_spacer,$c_comment)=split('\t',$current_line);
+			#											
+			#		#---- check for gaps ---								
+			#		if(($c_repeat=~/^-/ and $k1 >4) or ( $k1 < $#current_array-1 and $c_repeat=~/-$/ and $c_spacer and $c_spacer=~m/(A|C|G|T)/i))
+			#			{
+			#				$gaps_detected_in_repeat_edges++;
+			#				
+			#				if($c_repeat=~/^(-+)/)
+			#					{
+			#						my $gaps=$1;
+			#						if(length($gaps)>$max_gap_length){$max_gap_length=length($gaps);}
+			#					}
+			#				if($c_repeat=~/(-+)$/)
+			#					{
+			#						my $gaps=$1;
+			#						if(length($gaps)>$max_gap_length){$max_gap_length=length($gaps);}
+			#					}	
+			#				#last;
+			#			}
+			#	}
+			#if($gaps_detected_in_repeat_edges >0)
+			#	{
+			#		#print "Gaps detected in the repeats of this array: $qryID\n";
+			#		#foreach my $row(@current_array)
+			#		#	{
+			#		#		print "$row\n";
+			#		#	}
+			#
+			#		&fix_arrays_with_gaps_in_indevidual_repeats($model_repeat,\@current_array);
+			#		
+			#		#print "\nAfter Gaps fixed in the repeats of this array:\n";
+			#		#foreach my $row(@current_array)
+			#		#	{
+			#		#		print "$row\n";
+			#		#	}
+			#	}	
+			
+					
+			
+			##########################---- find left and right flanks
+			my $gapless_last_repeat=$arr_repeats[$#arr_repeats]; $gapless_last_repeat=~s/-//g;
+			
+			my $array_start=$arr_repeat_start_positions[0];
+			my $array_stop=$arr_repeat_start_positions[$#arr_repeat_start_positions]+length($gapless_last_repeat);
+			my $range="$array_start-$array_stop";
+			my $species="NA";
+			
+			my $left_flank ="|";
+			my $right_flank="|";
+			
+			my $left_flank_length=500;
+			my $right_flank_length=500;
+			
+			($left_flank,$right_flank)=&get_flanking_sequences($qry_seq,$array_start,$array_stop,$left_flank_length,$right_flank_length,$left_flank,$right_flank);						
+			#print "# Left flank :   $left_flank\n";
+			#print "# Right flank :  $right_flank\n";
+			
+
+
+
+			
+			######## calculate the array quality score				
+			my($array_quality_score,$score_det,$score_legend)=&calculate_array_quality_score($range,$qryID,$species,$matching_reference_repeat,$model_repeat,\@current_array);
+			$array_quality_score= sprintf("%.2f",$array_quality_score);
+			
+			#print "$array_quality_score\n$score_det\n$score_legend\n";
+			
+			#print "# Questionable array : NO\t Score: $array_quality_score\n";
+			#print "#       Score Detail : $score_det\n";
+			#print "#       Score Legend : $score_legend\n";
+			
+			
+			
+			############### check the direction and if the direction is minus, then reverse the array, and the associated elements-
+			if($direction eq "minus")
+				{
+					my @modified_array;
+					my $case_found=0;
+					($model_repeat,$case_found)=&reverse_an_array($range,$qryID,$model_repeat,\@current_array,\@modified_array);
+					
+					#------------ complete the @modified array ---
+					for(my $m=3;$m>=0;$m--)
+						{
+							unshift(@modified_array,$current_array[$m]);
+							#shift(@modified_array);
+						}
+					push(@modified_array,$current_array[$#current_array]);
+					@current_array=@modified_array;
+					#-- change the flanks
+					
+					#--- change the 
+				}
+			
+			
+			
+			
+			############ identify if metaCRISPRDetect didn't perform well enough to handle the CRISPR in the current read; call for a full CRISPRDetect run on this read
+			my $need_detailed_analysis=0;
+			
+			#------ check for length difference --
+			if(length($model_repeat) < length($matching_reference_repeat)-5)
+				{
+					$need_detailed_analysis++;
+				}
+				
+			#------ check any of the repeats has lots of bases, or all the repeats has insertions --
+			my $repeats_with_insertions=0;
+			my $total_repeats=0;
+			#if(length($model_repeat) < length($matching_reference_repeat)-5)
+			#	{
+					for(my $k1=4;$k1<=$#current_array-1;$k1++)
+						{							
+							my $current_line=$current_array[$k1]; 
+							chomp $current_line; $current_line=~s/\r+//g; $current_line=~s/^\s+//;#$current_line=~s/\s+/\s/g;
+										
+							my($c_start,$c_repeat,$c_spacer,$c_comment)=split('\t',$current_line);
+							
+							my $gapless_and_dotless_c_repeat=$c_repeat; $gapless_and_dotless_c_repeat=~s/\-//g; $gapless_and_dotless_c_repeat=~s/\.//g; 
+							
+							if($c_comment and $c_comment=~/\[/)
+								{
+									$repeats_with_insertions++;
+								}
+							
+							#---- check for gaps ---	
+							if($c_repeat=~/^-/ and $c_repeat=~/-$/)
+								{
+									$need_detailed_analysis++;
+									#last;
+								}
+							if(($c_repeat=~/^-/ and $k1 >4) or ($c_repeat=~/-$/ and $c_spacer and $c_spacer=~m/(A|C|G|T)/i))
+								{
+									$need_detailed_analysis++;
+									#last;
+								}
+							#---- check for repeat length	
+							if(length($gapless_and_dotless_c_repeat) >length($model_repeat)*0.33)
+								{
+									$need_detailed_analysis++;
+									#last;
+								}
+							
+							$total_repeats++;										
+						}					
+			#	}
+				
+			if($repeats_with_insertions == $total_repeats)
+				{
+					$need_detailed_analysis++;
+				}
+			
+			
+			
+			################################################## Reporting block #######################################
+			if($need_detailed_analysis==0)
+				{
+					my @arr_predicted_crispr;			
+					&create_crisprdetect_formatted_array($qryID,$refID,$direction,$array_start,$array_stop,$model_repeat,$longest_spacer_length,$left_flank,$right_flank,$array_quality_score,$score_det,$score_legend,$total_insertions_in_crispr,\@current_array,\@arr_predicted_crispr);
+					
+					#---- print the current repeat if the user given conditions are met
+					if($array_quality_score >= $array_quality_score_cutoff and $total_repeats >= $minimum_no_of_repeats)
+						{					
+							foreach my $row(@arr_predicted_crispr)
+								{									
+									print CRISPR "$row\n";
+								}
+						}
+					#--- else print to the fp file --	
+					else{
+							foreach my $row(@arr_predicted_crispr)
+								{									
+									print FP "$row\n";
+								}
+						}			
+				}
+			elsif($need_detailed_analysis >0)
+				{
+					$hash_of_readIDs_needed_to_be_analyzed_with_full_crispr_detect->{$qryID}=1;
+				}	
+		}	
+		
+	close(CRISPR);	
+	close(FP);	
+	
+	
+	#--- check if there are any questionable crispr containing reads
+	open(QUES,">$questionable_crispr_containing_reads");
+	foreach my $qryID(keys %{$hash_of_readIDs_needed_to_be_analyzed_with_full_crispr_detect})
+		{
+			if(not $hash_of_simplified_read_id_and_original_read_id{$qryID})
+				{
+					#print "*** not found \$hash_of_simplified_read_id_and_original_read_id{$qryID}\n"; 
+					next;
+				}
+			print QUES ">$hash_of_simplified_read_id_and_original_read_id{$qryID}\n$hash_of_selected_readID_and_seq->{$qryID}\n"; 
+		}
+	close(QUES);
+	
+		
+	return 1;
+}
+
+
+sub convert_crisprdetect_formatted_arrays_to_metacrisprdetect_format()
+	{
+		my($crispr_detect_output2,$mcd_output1)=@_;
+		
+		#--- read the arrays from crispr_detect_output2
+		
+		my @arr_cd_arrays=`cat $crispr_detect_output2 >&1`;
+		
+		my @arr_mCD_arrays;
+		
+		my $skip_array=0;
+		
+		my $seqID="";
+		my $primary_repeat="";
+		for(my $i=0;$i<=$#arr_cd_arrays; $i++)
+			{
+				my $row=$arr_cd_arrays[$i]; chomp $row; $row=~s/\r//;
+				
+				#--- get the seqID and primary repeat, as it will be required to identify the matching DB repeat
+				
+				#--- get the primary repeat --
+				if($row=~/# Primary repeat/) #   # Primary repeat :     GTTCCAATAAGACTTTAGAAGTATTGAAAG
+					{
+						my @arr_r1=split(' ',$row);
+						$primary_repeat=$arr_r1[$#arr_r1];
+					}
+				if($row=~/>/) #   # Primary repeat :     GTTCCAATAAGACTTTAGAAGTATTGAAAG
+					{
+						my @arr_r1=split('\t',$row);
+						$seqID=$arr_r1[0]; $seqID=~s/>//;
+					}	
+					
+					
+				############# start pushing the rows in the target array 	
+				#--- print the blank rows
+				if($arr_cd_arrays[$i-1] and $arr_cd_arrays[$i-1]=~/\S+/ and $row !~/\S+/  ) #--- this will prevent printing multiple empty rows
+					{
+						push(@arr_mCD_arrays,"");
+						
+						#print APP "\n";
+						next;
+					}
+				
+				#---- print the header fild [but replace CRISPRDetect 3.0 ]
+				if($row=~/^Array/)
+					{						
+						$row=~s/CRISPRDetect \d+ \*/metaCRISPRDetect $version \*/g;
+						
+						push(@arr_mCD_arrays,$row);
+						#print APP "$row\n";
+						next;
+					}
+					
+				#--- then the other fields [Note: this should always be before the repeat/spacer match details, aso some of these rows might contain tabs]	
+				if($row=~/^(>|# Left flank |# Right flank|# Questionable array |# 	Score |# Primary |# Summary|\/\/)/)
+					{						
+						push(@arr_mCD_arrays,$row);
+						#print APP "$row\n";
+						next;
+					}
+				#----- the repeat and spacer fields	
+				if($row=~/\t/)
+					{
+						#--- check if >=3 tabs are there
+						my @arr_fields=split('\t',$row);
+						if($#arr_fields >3) #  Position	Repeat	   %id	Spacer	Repeat_Sequence             	Spacer_Sequence                 	Insertion/Deletion
+							{
+								if(not $arr_fields[5]){$arr_fields[5]="";}
+								if(not $arr_fields[6]){$arr_fields[6]="";}
+								
+								
+								push(@arr_mCD_arrays,"$arr_fields[0]\t$arr_fields[4]\t$arr_fields[5]\t$arr_fields[6]");
+								#print APP "$arr_fields[0]\t$arr_fields[4]\t$arr_fields[5]\t$arr_fields[6]\n";								
+								next;
+							}
+					}
+					
+				if($row=~/Reference repeat match prediction/)
+					{
+						# change 	Reference repeat match prediction:         F [matched GTTCACTGCCGTATAGGCAGCTAAGAAA with 100% identity] Score: 4.5/4.5 
+						#  to # Macthing DB repeat : GTTCACTGCCGTATAGGCAGCTAAGAAA [ REF_REPEAT_CLUSTER_799-SIZE_5937-S_21 with Identity 100.0% ]
+						
+						#--- if NA
+						if($row=~/\[matched (\w+) with (\d+)% identity\]/)
+							{
+								my $ref_repeat_seq=$1;
+								my $identity=$2;
+								
+								#--- get the ref_repeat_ID
+								if($hash_of_repeat_seq_and_seqID{$ref_repeat_seq})
+									{
+										my $ref_repeatID=$hash_of_repeat_seq_and_seqID{$ref_repeat_seq};
+										
+										push(@arr_mCD_arrays,"# Macthing DB repeat : $ref_repeat_seq [ $ref_repeatID with Identity $identity% ]");
+										#print APP "# Macthing DB repeat : $ref_repeat_seq [ $ref_repeatID with Identity $identity% ]\n";										
+										next;
+									}
+							}
+						else{
+								#--- blast the $primary_repeat against the $reference_repeatDB; and find the best matching repeat with conditions [the primary repeat should have >95% identity and >95% coverage]
+								my $tmp_filename=$seqID; $tmp_filename=~s/\W//g; $tmp_filename=~s/\s+//g; $tmp_filename=~s/\'//g; $tmp_filename=~s/\"//g;
+								$tmp_filename=$tmp_filename.&get_unique_id();
+								
+								#--- write the seq
+								my $tmp_file="$tmp_dir/$tmp_filename.fa";
+								open(WR,">$tmp_file");
+								print WR ">$seqID\n$primary_repeat\n";
+								close(WR); 
+								
+								#--- do the blastn --
+								#print "Check 2: blast_output_file \n";
+								system("blastn -task blastn -perc_identity 90 -word_size 7 -dust no -culling_limit 1 -num_alignments 1 -num_threads 1 -db $reference_repeatDB -query $tmp_file -out $tmp_file.blastn -outfmt '6 sseqid stitle sstart send qseqid qstart qend sstrand length score mismatch gaps sseq qseq pident qcovs slen qlen' >/dev/null 2>/dev/null");	
+								
+								#--- apply the conditions
+								my $reference_repeatID="";
+								my $ret=`head -1 $tmp_file.blastn | awk -F '\t' '{if(\$15>=95 && \$9 >= \$17*0.95 ){print \$1"\t"\$15}}' >&1`; chomp $ret; $ret=~s/\r//;
+								
+								if($ret and $ret=~/\t/)
+									{
+										my($ref_repeatID,$pID)=split('\t',$ret);
+										
+										my $ref_repeat_seq=$hash_of_ref_repeat_seqID_and_seq{$ref_repeatID};
+										
+										#print "$primary_repeat matched $ref_repeat_seq [ $ref_repeatID with Identity $pID% ]\n";
+										
+										push(@arr_mCD_arrays,"# Macthing DB repeat : $ref_repeat_seq [ $ref_repeatID with Identity $pID% ]");
+									}
+								else{
+										$skip_array++;
+									}	
+								#print APP "# Macthing DB repeat : NA\n";		#---- this is not possible in metaCRISPRDetect; fix it						
+								
+								
+								
+								next;
+							}						
+					}					
+			}
+			
+		if($skip_array==0)
+			{	
+				open(APP,">>$mcd_output1");	
+				flock(APP,2);
+				foreach my $row(@arr_mCD_arrays)
+					{
+						print APP "$row\n";
+					}
+				close(APP);
+			}
+		return 1;
+	}
+
+sub load_seqID_and_seq_in_hash_and_seq_to_seqIDs_too()
+	{
+		my($input_seq_file,$hash_of_full_seqID_and_seq,$hash_of_repeat_seq_and_seqID)=@_;
+		
+		#print "\$input_seq_file=$input_seq_file\n";
+		
+		
+		my $seq_index=0;
+		my $last_seq_id="";
+		my $seq="";
+		my $seq_rc="";
+		
+		open(RD,"$input_seq_file");
+		while( my $line=<RD> )
+			{				
+				chomp $line; $line=~ s/\r//; $line=~ s/^\s+//; 
+				#print "$line\n";
+				
+				if($line=~/^>/)
+					{
+						#print "matched\n";
+						if($seq_index>0)
+							{	
+								
+								$hash_of_full_seqID_and_seq->{$last_seq_id}=$seq;
+								
+								#--- reverse complement
+								$seq_rc=$seq; $seq_rc=reverse($seq_rc); $seq_rc=~tr/ACGT/TGCA/;
+								$hash_of_repeat_seq_and_seqID->{$seq}=$last_seq_id;
+								$hash_of_repeat_seq_and_seqID->{$seq_rc}=$last_seq_id;
+								
+								
+								#-----
+								$last_seq_id="";
+								$seq="";
+								$seq_rc="";
+							}						
+						
+	
+						$last_seq_id=$line;	chomp $last_seq_id;$last_seq_id=~ s/\r//; $last_seq_id=~ s/^>//;												
+						$seq_index++;
+					}
+				else{						
+						$seq=$seq.$line;								
+					}																	 								 						 
+				#print WR "$line\n";												
+			 }
+
+		if($last_seq_id=~/\S+/ and $seq=~/\S+/)
+			{	
+				$hash_of_full_seqID_and_seq->{$last_seq_id}=$seq;	
+				
+				#--- reverse complement
+				$seq_rc=$seq; $seq_rc=reverse($seq_rc); $seq_rc=~tr/ACGT/TGCA/;
+				$hash_of_repeat_seq_and_seqID->{$seq}=$last_seq_id;
+				$hash_of_repeat_seq_and_seqID->{$seq_rc}=$last_seq_id;					
+										
+			}
+		close(RD); 
+	
+		return 1;
+	}	
+	
+
+
+
+sub create_additional_files()
+	{		
+		
+		my($output_crispr_file,$repeats_fasta_file,$spacers_fasta_file,$gff_file)=@_;
+	
+			
+		#---- load the CRISPRs in an array
+		open(RD,"$output_crispr_file");
+		my @arr_crispr_file=<RD>;
+		close(RD);	
+		
+		#---- open the files set to be created	
+		if($create_repeats_fasta_file==1)
+			{
+				open(DRS,">$repeats_fasta_file") or print "$!";
+			}
+		if($create_spacers_fasta_file==1)
+			{
+				open(SPA,">$spacers_fasta_file") or print "$!";
+			}
+		if($create_gff_file==1)
+			{
+				open(GFF,">$gff_file") or print "$!";
+			}
+		#---
+		
+		
+		for(my $i=0;$i<=$#arr_crispr_file;$i++)
+			{
+				my $line=$arr_crispr_file[$i]; chomp $line; 
+			
+				
+				
+				if($line=~ /^>/)     #------ first level--------------------------------------------------------
+					{
+						my($org_id,$crispr_index,$array_start,$array_stop,$array_direction);
+						
+						#----- get CRISPR index from previous line------------------------------------------------------------------
+						my $previous_line=$arr_crispr_file[$i-1];chomp $previous_line;$previous_line=~ s/\r//;						
+						if($previous_line =~ /Array (\d+) (\d+)-(\d+)/)
+							{
+								$crispr_index=$1;
+								$array_start=$2;
+								$array_stop=$3;								
+								
+							}
+						#---- now get the direction ------------------------------------------------------------------------------	
+						if($line=~/>(\S+)\t/)
+							{
+								$org_id=$1; chomp $org_id; $org_id=~s/\r+//g;
+							}
+												
+						if($line=~/Array_Orientation: (\S+)/)
+							{
+								$array_direction=$1; chomp $array_direction; $array_direction=~s/\r+//g;
+							}
+						#--- sort the start and stop if needed
+						my $strand="+";
+						if($array_direction=~/Reverse/)
+							{
+								($array_start,$array_stop)=&sort_two_numbers($array_start,$array_stop);
+								$strand="-";
+							}
+						
+						#--- get the $crispr_length
+						my $crispr_length= $array_stop - $array_start+1;		
+						
+						
+						
+						#---- now get the model repeat						
+						my $model_repeat;
+						
+						my $k=$i+4;
+						while($arr_crispr_file[$k] !~ /^\/\//)
+							{
+								if($arr_crispr_file[$k]=~/# Primary repeat :     (\S+)/)
+									{
+										$model_repeat=$1; 
+									}
+								$k++;
+							}
+						
+						#--- write the model_repeat to repeats fasta file
+						if($create_repeats_fasta_file==1)
+							{				
+								print DRS ">$org_id\|$crispr_index\_$array_start\_$array_stop\n$model_repeat\n";												
+							}
+								
+						#--- write the whole CRISPR specific record	
+						my $array_stop_1 = $array_stop - 1;
+						
+						if($create_gff_file==1)
+							{
+								print GFF "$org_id\tmetaCRISPRDetect\trepeat_region\t$array_start\t$array_stop_1\t$crispr_length\t$strand\t.\tID=CRISPR$crispr_index\_$array_start\_$array_stop;Note=$model_repeat;Dbxref=SO:0001459;Ontology_term=CRISPR\n";
+							}
+						
+						############# now write the individual DR and spacer specific records
+						my $repeat_index=1;					
+						my $spacer_index=1;	
+						
+							
+						
+						#---now convert all the dotted repeat, and add to sequence_strand on the go
+						my $j=$i+4;
+						while($arr_crispr_file[$j] !~/====/)
+							{
+								my $current_line=$arr_crispr_file[$j]; chomp $current_line; $current_line=~s/\r+//g; $current_line=~s/^\s+//;
+								   #$current_line=~s/\s+/ /g;
+								
+								
+								my @arr_t1=split('\t',$current_line);
+								my $r_start=$arr_t1[0];	$r_start=~s/\s+//g;
+								
+								my $r_seq=$arr_t1[1]; 	$r_seq=~s/\s+//g; 
+								my $s_seq=$arr_t1[2]; 	$s_seq=~s/\s+//g;
+								
+								my $original_r_seq=$r_seq;
+								$r_seq=~s/-//g;
+								$s_seq=~s/-//g;
+								
+								my $r_length=length($r_seq);
+								my $s_length=length($s_seq);
+								
+								
+								#---- dont forget to check insertion bases in comment ---------------------------
+								my $comment="";	
+								if($comment=$arr_t1[3] and $comment=$arr_t1[3]=~/\S+/)
+									{
+										$comment=$arr_t1[3];	$comment=~s/^\s+//;
+									}
+								my %hash_of_insertion_positions;
+								my $no_of_insertions=0;
+								if($comment and $comment=~/\S+/ and $comment !~/^Del/)
+									{
+										my @tmp_arr1=split(' ',$comment);
+										my $insertion_bases=$tmp_arr1[0];
+										my $insertion_positions=$tmp_arr1[1];
+
+										$insertion_bases=~s/,//g;
+										$no_of_insertions=length($insertion_bases);	
+
+									}
+								
+								#---- write the DR's record
+								if($r_seq =~ /\S+/)
+									{	
+										my($repeat_start,$repeat_stop);
+										
+										if($array_direction !~/^Rev/)
+											{
+												$repeat_start=$r_start;
+												$repeat_stop= $r_start + ($r_length + $no_of_insertions);												
+											}
+										else{
+												$repeat_start= $r_start - ($r_length + $no_of_insertions);
+												$repeat_stop=$r_start;																								
+											}						
+										
+										my $repeat_length=length($r_seq);
+										
+										#--- change dots to bases --
+										my $repeat_string=&change_dots_to_bases($original_r_seq,$model_repeat);
+										
+										my $repeat_stop_1 = $repeat_stop - 1;
+										if($create_gff_file==1)
+											{
+												print GFF "$org_id\tmetaCRISPRDetect\tdirect_repeat\t$repeat_start\t$repeat_stop_1\t$repeat_length\t$strand\t.\tID=CRISPR$crispr_index\_REPEAT$repeat_index\_$repeat_start\_$repeat_stop;Name=CRISPR$crispr_index\_REPEAT$repeat_index\_$repeat_start\_$repeat_stop;Parent=CRISPR$crispr_index\_$array_start\_$array_stop;Note=$repeat_string;Dbxref=SO:0001459;Ontology_term=CRISPR\n";
+											}
+				
+										$repeat_index++;
+									}
+								#---- write the specer specific record
+								if($s_seq =~ /\S+/ and $s_seq !~/^\|/)
+									{	
+										my($spacer_start,$spacer_stop);
+										
+										if($array_direction !~/^Rev/)
+											{
+												$spacer_start=$r_start + ($r_length + $no_of_insertions);
+												$spacer_stop= $spacer_start + length($s_seq);											
+											}
+										else{
+												$spacer_start= $r_start - ($r_length + $no_of_insertions);	
+												$spacer_stop= $spacer_start - length($s_seq);
+																							
+											}						
+										
+										my $spacer_length=length($s_seq);
+										
+										#-----
+										my $spacer_string=$s_seq;
+										
+										my $spacer_stop_1 = $spacer_stop - 1;										
+										if($create_gff_file==1)
+											{
+												print GFF "$org_id\tmetaCRISPRDetect\tbinding_site\t$spacer_start\t$spacer_stop_1\t$spacer_length\t$strand\t.\tID=CRISPR$crispr_index\_SPACER$spacer_index\_$spacer_start\_$spacer_stop;Name=CRISPR$crispr_index\_SPACER$spacer_index\_$spacer_start\_$spacer_stop;Parent=CRISPR$crispr_index\_$array_start\_$array_stop;Note=$spacer_string;Dbxref=SO:0001459;Ontology_term=CRISPR\n";
+											}
+										
+										#--- also write the spacer sequence to spacer_sequence_fasta_file
+										if($create_spacers_fasta_file==1)
+											{
+												print SPA ">$org_id\|$crispr_index\_$array_start\_$array_stop\|$crispr_index\_$spacer_index\_$spacer_start\_$spacer_stop\|$spacer_length\n$s_seq\n";
+											}
+										$spacer_index++;
+									}									
+								#--------------------------------------------------------------------------------------------	
+						
+								$j++;
+							}
+						$i=$j;
+					}
+			}
+		
+	
+		#---- close the files set to be created	
+		if($create_repeats_fasta_file==1)
+			{
+				close(DRS);
+			}
+		if($create_spacers_fasta_file==1)
+			{
+				close(SPA);
+			}
+		if($create_gff_file==1)
+			{
+				close(GFF);
+			}
+			
+		return 1;		
+	}
+
+
+
+sub sort_two_numbers()
+	{
+		my($number1,$number2)=@_;
+		
+		my @arr_t1;
+		push(@arr_t1,$number1);
+		push(@arr_t1,$number2);
+		
+		@arr_t1=sort{$a<=>$b} @arr_t1;
+		return($arr_t1[0],$arr_t1[1]);
+	}
+
+sub fix_arrays_with_gaps_in_indevidual_repeats()
+	{
+		my($model_repeat,$current_array)=@_;
+		
+			
+		#_---
+		my @arr_model_repeat_bases=split('',$model_repeat);	
+		
+		for(my $k1=4;$k1<=$#{$current_array}-1;$k1++)
+			{
+				#print "@{$current_array-[0]}\n";
+				my $current_line=$$current_array[$k1]; 
+				chomp $current_line; $current_line=~s/\r+//g; $current_line=~s/^\s+//;#$current_line=~s/\s+/\s/g;
+							
+					#print "$current_line\n";
+							
+				#my @tmp_array=split('\t',$current_line);
+				
+				my($c_start,$c_repeat,$c_spacer,$c_comment)=split('\t',$current_line);
+				if(not $c_comment){$c_comment="";}
+				
+				#--- check if there are gaps at the right
+				if($k1>=4 and $k1<= $#{$current_array}-2 and $c_repeat=~/(-+)$/)
+					{
+						#if($c_repeat=~/(-+)$/)
+						#	{
+								my $gaps_at_right=$1;
+								my $bases_to_add_on_right=length($gaps_at_right);
+								my $bases="";
+								if($c_spacer=~/^(\w{$bases_to_add_on_right})/)
+									{
+										$bases=$1;
+										
+										#--- remove the bases from spacer
+										$c_spacer=~s/^$bases//;
+									}
+								#--- remove the gaps from the repeat and add the bases
+								$c_repeat=~s/-{$bases_to_add_on_right}$//;	
+								$c_repeat=$c_repeat.$bases;
+								
+									
+						#	}							
+					}
+					
+				#--- check if there are gaps at the left
+				if($k1>4 and $k1<= $#{$current_array}-1 and $c_repeat=~/^(-+)/)
+					{
+						#if($c_repeat=~/^(-+)/)
+						#	{
+								
+								my $gaps_at_left=$1;
+								my $bases_to_add_on_left=length($gaps_at_left);
+								my $bases="";
+								
+								#--- get the last row 
+								my($o_start,$o_repeat,$o_spacer,$o_comment)=split('\t',$$current_array[$k1-1]);
+								
+								if($o_spacer=~/(\w{$bases_to_add_on_left})$/)
+									{
+										$bases=$1;
+										#--- remove the bases from the old spacer
+										$o_spacer=~s/$bases$//;
+									}
+								#--- remove the gaps from the current repeat and add the bases	
+								$c_repeat=~s/^-{$bases_to_add_on_left}//;
+								$c_repeat=$bases.$c_repeat;	
+								
+								#--- create a old row and push it
+								$c_start=$c_start-length($bases);
+								
+								my $o_row="$o_start\t$o_repeat\t$o_spacer\t$o_comment";	
+									$$current_array[$k1-1]=$o_row;
+						#	}							
+					}
+				#----
+				
+				my @arr_repeat_bases=split('',$c_repeat);
+				for(my $i=0;$i<=$#arr_model_repeat_bases;$i++)
+					{
+						if($arr_model_repeat_bases[$i] eq "-" ) #and $arr_repeat_bases[$i] eq "-")
+							{
+								$arr_repeat_bases[$i]="";
+							}
+					}
+				my $new_c_repeat=join("",@arr_repeat_bases);
+				my $row="$c_start\t$new_c_repeat\t$c_spacer\t$c_comment";	
+				$$current_array[$k1]=$row;
+			}
+		
+		
+		
+		return 1;
+	}
+
+
+########### CRISPRDetect modules
+
+sub create_crisprdetect_formatted_array()
+	{
+		my($qryID,$refID,$direction,$array_start,$array_stop,$model_repeat,$longest_spacer_length,$left_flank,$right_flank,$array_quality_score,$score_det,$score_legend,$total_insertions_in_crispr,$current_array,$arr_predicted_crispr)=@_;
+			
+		if($direction=~/plus/)
+			{
+				$direction="Forward";
+			}
+		else{
+				$direction="Reverse";
+				
+				#-- fix the start position of reverse array 
+				if($array_start >0)
+					{
+						$array_start=$array_start-1;
+					}
+				
+			}
+				
+			#--- header ---
+			push(@$arr_predicted_crispr,"Array 1 $array_start-$array_stop\t\t **** Predicted by metaCRISPRDetect $version *** ");
+			push(@$arr_predicted_crispr,">$hash_of_simplified_read_id_and_original_read_id{$qryID}\tArray_Orientation: $direction");
+			push(@$arr_predicted_crispr,"");
+			
+			#--- repeat and spacer alignments --
+			my $Position_str1=&fill_string_with_gaps("Position",10,"LEFT");
+			my $Position_eqa1=&fill_string_with_equal_sign("=",10,"LEFT");
+			
+			my $Repeat_sequence_str1=&fill_string_with_gaps("Repeat_sequence",length($model_repeat),"RIGHT");
+			my $Repeat_sequence_eqa1=&fill_string_with_equal_sign("=",length($model_repeat),"RIGHT");
+			
+			my $Spacer_sequence_str1=&fill_string_with_gaps("Spacer_sequence",$longest_spacer_length,"RIGHT");
+			my $Spacer_sequence_eqa1=&fill_string_with_equal_sign("=",$longest_spacer_length,"RIGHT");
+			
+			my $comment_str1=&fill_string_with_gaps("Insertion/Deletion",length($model_repeat),"RIGHT");
+			my $comment_eqa1=&fill_string_with_equal_sign("=",18,"RIGHT");
+			
+			push(@$arr_predicted_crispr,"$Position_str1\t$Repeat_sequence_str1\t$Spacer_sequence_str1\t$comment_str1");
+			push(@$arr_predicted_crispr,"$Position_eqa1\t$Repeat_sequence_eqa1\t$Spacer_sequence_eqa1\t$comment_eqa1");
+			
+			
+			
+			#push(@$arr_predicted_crispr,"Position\tRepeat_sequence\tSpacer_sequence\tInsertion/Deletion");
+			#push(@$arr_predicted_crispr,"===============================================================");
+			my @arr_dotted_repeats;			
+			my @arr_spacers;		
+			for(my $k1=4;$k1<=$#{$current_array}-1;$k1++)
+				{							
+					my $current_line=$$current_array[$k1]; chomp $current_line; $current_line=~s/\r+//g; $current_line=~s/^\s+//;	#$current_line=~s/\s+/\t/g;		
+					
+					my @arr_t1=split('\t',$current_line);
+					my $pos=$arr_t1[0];
+					my $dr=$arr_t1[1];
+					my $sp=$arr_t1[2];
+					
+					push(@arr_dotted_repeats,$dr);
+					if($sp!~/\|/)
+						{
+							push(@arr_spacers,$sp);
+						}
+					
+					
+					my $pos_str=&fill_string_with_gaps($pos,10,"LEFT");
+					my $dr_str=&fill_string_with_gaps($dr,length($model_repeat),"RIGHT");
+					my $sp_str=&fill_string_with_gaps($sp,$longest_spacer_length,"RIGHT");
+					my $com_str="";
+					if($arr_t1[3] and $arr_t1[3]=~/\S+/)
+						{
+							$com_str=&fill_string_with_gaps($arr_t1[3],length($arr_t1[3]),"RIGHT");
+						}
+					
+										
+					push(@$arr_predicted_crispr,"$pos_str\t$dr_str\t$sp_str\t$com_str");
+				}			
+			#push(@$arr_predicted_crispr,"===============================================================");
+			push(@$arr_predicted_crispr,"$Position_eqa1\t$Repeat_sequence_eqa1\t$Spacer_sequence_eqa1\t$comment_eqa1");
+			
+			my $nof_repeats=$#$current_array-4;
+			my $nof_repeats_str1=&fill_string_with_gaps($nof_repeats,10,"LEFT");			
+			push(@$arr_predicted_crispr,"$nof_repeats_str1\t$model_repeat");			
+						
+			#--- Flank associated parameters ----
+			push(@$arr_predicted_crispr,"");
+			push(@$arr_predicted_crispr,"# Left flank :   $left_flank");
+			push(@$arr_predicted_crispr,"# Right flank :  $right_flank");
+			
+			#--- score associated parameters ----
+			push(@$arr_predicted_crispr,"");			
+			push(@$arr_predicted_crispr,"# Questionable array : NO\t Score: $array_quality_score");
+			push(@$arr_predicted_crispr,"#       Score Detail : $score_det");
+			push(@$arr_predicted_crispr,"#       Score Legend : $score_legend");
+			
+			#--- repeat associated parameters ----
+			if(not $hash_of_ref_repeat_seqID_and_seq{$refID})
+				{
+					print "\nError: Could not find sequence for $refID\n";
+					return 1;
+				}
+			
+			my $reference_repeat_seq=$hash_of_ref_repeat_seqID_and_seq{$refID};
+			my $model_repeat_identity_to_reference_repeat=`water -asequence=asis:$model_repeat -bsequence=asis:$reference_repeat_seq -stdout -auto -aformat3 markx1 |  grep '# Similarity:' | awk -F ' ' '{print \$NF}' >&1`;
+			chomp $model_repeat_identity_to_reference_repeat; $model_repeat_identity_to_reference_repeat=~s/\r//; $model_repeat_identity_to_reference_repeat=~s/\(//g; $model_repeat_identity_to_reference_repeat=~s/\)//g; 
+			
+			push(@$arr_predicted_crispr,"");
+			push(@$arr_predicted_crispr,"# Primary repeat :     $model_repeat");
+			push(@$arr_predicted_crispr,"# Macthing DB repeat : $reference_repeat_seq [ $refID with Identity $model_repeat_identity_to_reference_repeat ]");
+			
+			
+			###---- finally a summary line: CRISPR_seq_ID-start-stop,direction, Representative DR, number of DRs, number of non-propagating mutation(s), number of insertions/deletions, score,    
+			my $show_stat=1;
+			if($show_stat==1)
+			{
+				#$original_seqID-$array_start_position-$array_stop_position
+				#my ($crispr_start,$crispr_stop)=&sort_two_numbers($array_start_position,$array_stop_position);
+				my $short_direction=substr($direction,0,1);
+				my $seqID_start_stop_direction="$hash_of_simplified_read_id_and_original_read_id{$qryID}-$array_start-$array_stop-$short_direction";
+				
+				my $REP_DR=$model_repeat;
+				my $DR_LENGTH=length($model_repeat);
+				
+				my $num_DRs=$nof_repeats;
+				
+				my $num_MUTATIONS=0;
+				foreach my $dotted_repeat(@arr_dotted_repeats)
+					{
+						chomp $dotted_repeat;$dotted_repeat=~s/\r//;
+						my $d_rep=$dotted_repeat; 
+						$d_rep=~s/\.//g;
+						$d_rep=~s/^-+//;
+						$d_rep=~s/-+$//;
+						
+						#print "\$$dotted_repeat= $dotted_repeat\t\$d_rep=$d_rep\n";
+						$num_MUTATIONS=$num_MUTATIONS+length($d_rep);
+					}
+				
+				my $num_INSERTIONS=$total_insertions_in_crispr;
+				my $SCORE=$array_quality_score;
+				my $SPACERS=join(",",@arr_spacers);
+				
+				push(@{$arr_predicted_crispr}," ");
+				push(@{$arr_predicted_crispr},"# Summary: ID_START_STOP_DIR: $seqID_start_stop_direction; REP_DR:$REP_DR; DR_LENGTH:$DR_LENGTH; NUM_DRs:$num_DRs; MUTATIONS:$num_MUTATIONS; INSERTIONS:$num_INSERTIONS; SCORE:$SCORE; SPACERS:$SPACERS");	
+								
+			}
+			#--- end block			
+			push(@$arr_predicted_crispr,"");	
+			push(@$arr_predicted_crispr,"//");	
+			push(@$arr_predicted_crispr,"");	
+			
+			
+		
+		return 1;
+	}
+
+sub get_model_repeat()
+	{
+		my($matching_reference_repeat,$hash_of_repeat_and_count)=@_;
+		
+		my $model_repeat="";
+		
+		
+		###--- first: check if there is only one repeat
+		my $nof_repeats=keys %{$hash_of_repeat_and_count}; 
+		if($nof_repeats==1)
+			{
+				foreach my $c_rep(keys %{$hash_of_repeat_and_count})
+					{
+						$model_repeat=$c_rep;
+						last;
+					}
+				return ($model_repeat);	
+			}
+		
+		#--- second: there are more than one repeat---	
+		if($nof_repeats >=1)
+			{
+				#--- check which repeat if found more times		
+				my %hash_of_selected_repeats_with_highest_count;
+				my $highest_count=0;
+				foreach my $c_rep(sort{$hash_of_repeat_and_count->{$b}<=>$hash_of_repeat_and_count->{$a}} keys %{$hash_of_repeat_and_count})
+					{
+						if($c_rep !~/-/)
+							{		
+								my $count= $hash_of_repeat_and_count->{$c_rep};
+								if($count >=$highest_count)
+									{
+										$highest_count=$count;
+										$hash_of_selected_repeats_with_highest_count{$count}{$c_rep}=1;	
+										
+										$model_repeat=$c_rep;
+									}
+								else{
+										last;
+									}													
+							}
+					}
+				my $nof_repeats_with_highest_count=keys %{$hash_of_selected_repeats_with_highest_count{$highest_count}};	
+					
+				#---- check if there are more than 1 repeat with the highest count that doesn't have any gaps in them				
+				if($nof_repeats_with_highest_count >1)
+					{				
+						my %hash_of_repeat_and_identity;		
+						foreach my $count(sort{$b<=>$a} keys %hash_of_selected_repeats_with_highest_count)
+							{							
+								foreach my $c_rep(keys %{$hash_of_selected_repeats_with_highest_count{$count}})
+									{
+										my $c_repeat_identity_to_reference_repeat=`water -asequence=asis:$c_rep -bsequence=asis:$matching_reference_repeat -stdout -auto -aformat3 markx1 |  grep '# Similarity:' | awk -F ' ' '{print \$NF}' >&1`;
+										chomp $c_repeat_identity_to_reference_repeat; $c_repeat_identity_to_reference_repeat=~s/\r//; 
+										$c_repeat_identity_to_reference_repeat=~s/\(//g; $c_repeat_identity_to_reference_repeat=~s/\)//g; $c_repeat_identity_to_reference_repeat=~s/\%//g; 
+										
+										$hash_of_repeat_and_identity{$c_rep}=$c_repeat_identity_to_reference_repeat;
+									}
+							}
+						#--- now select the first one 
+						foreach my $c_rep(sort{$hash_of_repeat_and_identity{$b}<=>$hash_of_repeat_and_identity{$a}} keys %hash_of_repeat_and_identity)
+							{
+								$model_repeat=$c_rep;
+								last;
+							}	
+					}
+				else{
+						#---- it seems all the repeats has one or more gaps in them
+						foreach my $c_rep(keys %{$hash_of_repeat_and_count})
+							{
+								$model_repeat=$c_rep;
+								last;
+							}
+					}	
+			}	
+				
+		return ($model_repeat);
+	}				
+	
+	
+sub fill_string_with_gaps()
+	{
+		my($object,$length,$side)=@_;
+		
+		if(not defined $object or $object eq "NA"){$object="";}
+		
+		my $gap_filled_string=$object;
+		
+		for(my $i=0;$i<=$length;$i++)
+			{
+				if(length($gap_filled_string)==$length){last;}
+				
+				if($side eq "RIGHT")
+					{
+						$gap_filled_string=$gap_filled_string." ";
+					}
+				else{
+						$gap_filled_string=" ".$gap_filled_string;
+					}		
+			}
+		
+		return($gap_filled_string);
+	}
+
+sub fill_string_with_equal_sign()
+	{
+		my($object,$length,$side)=@_;
+		
+		if(not defined $object or $object eq "NA"){$object="";}
+		
+		my $gap_filled_string=$object;
+		
+		for(my $i=0;$i<=$length;$i++)
+			{
+				if(length($gap_filled_string)==$length){last;}
+				
+				if($side eq "RIGHT")
+					{
+						$gap_filled_string=$gap_filled_string."=";
+					}
+				else{
+						$gap_filled_string="=".$gap_filled_string;
+					}		
+			}
+		
+		return($gap_filled_string);
+	}
+
+
+sub get_flanking_sequences()
+	{
+		my($species_seq,$array_start_position,$array_stop_position,$left_flank_length,$right_flank_length,$left_flank,$right_flank)=@_;
+		
+		if(($array_start_position-$left_flank_length)>0)
+					{
+						
+						$left_flank=substr($species_seq,($array_start_position-1-$left_flank_length),$left_flank_length);
+						#print "A: [$array_start_position - $left_flank_length] $left_flank\n";
+					}
+				else{
+						if($array_start_position>1)
+							{
+								$left_flank=substr($species_seq,0,($array_start_position-1));
+								#print "B: [$array_start_position - 1] $left_flank\n";
+							}						
+					}
+					
+				if(($array_stop_position-1+$right_flank_length)<=length($species_seq))
+					{
+						$right_flank=substr($species_seq,$array_stop_position-1,$right_flank_length);
+						#print "C: $right_flank\n";
+					}
+				else{
+						if($array_stop_position-1<length($species_seq))
+							{
+								$right_flank=substr($species_seq,$array_stop_position-1);								
+							}
+						#print "D: $right_flank\n",length($species_seq)," \$array_stop_position=$array_stop_position\n";
+					}
+		
+		return ($left_flank,$right_flank);
+	}
+
+
+sub get_repeat_start_and_repeat_sequence()
+	{
+		my($matching_reference_repeat,$ref_overlapping_region,$qry_seq,$qry_start,$qry_stop,$qry_overlapping_region,$new_qry_start,$new_qry_stop,$current_crispr_repeat)=@_;
+		
+		#--- remove gaps from ref_overlapping_region [if in case present]
+		$ref_overlapping_region=~s/-//g;
+		
+		my $gapless_qry_overlapping_region=$qry_overlapping_region; $gapless_qry_overlapping_region=~s/-//;
+		#--- declare the components ---
+		my $gaps_left="";
+		my $bases_available_on_left="";
+		
+		my $gaps_right="";
+		my $bases_available_on_right="";
+		
+		
+		
+		
+		
+		#-- get the nof bases needed both side
+		my $l_flanking_bases_needed=0;
+		my $l_flanking_bases="";
+		if($matching_reference_repeat=~/(\S+)$ref_overlapping_region/)
+			{
+				$l_flanking_bases=$1;
+				$l_flanking_bases_needed=length($l_flanking_bases);
+			}
+				
+		#--- first check the left --
+		if($l_flanking_bases_needed >0) #--- that is need fixing on the left
+			{
+				if($qry_start >1)
+					{
+						if($qry_seq=~/^(\w{1,$l_flanking_bases_needed})$gapless_qry_overlapping_region/)
+							{
+								$bases_available_on_left=$1;
+							}
+					}
+				#--- check how many bases are there on the left				
+				#if(($qry_start - $l_flanking_bases_needed -1) >= 0)
+				#	{
+				#		#--- get the available bases --						
+				#		$bases_available_on_left=substr($qry_seq,$qry_start-$l_flanking_bases_needed-1,$l_flanking_bases_needed);
+				#	}
+				#elsif($qry_start >1 and $qry_start < $l_flanking_bases_needed)
+				#	{						
+				#		$bases_available_on_left=substr($qry_seq,0,$qry_start-1);
+				#	}
+							
+				#--- identify how many gaps are needed
+				my $gaps_needed_on_the_left=$l_flanking_bases_needed-length($bases_available_on_left);
+				
+				for(my $i=1;$i<=$gaps_needed_on_the_left;$i++)
+					{
+						$gaps_left=$gaps_left."-";
+					}
+				$current_crispr_repeat=$gaps_left.$bases_available_on_left.$qry_overlapping_region;		
+			}
+			
+		#--- then check the right --	
+		my $r_flanking_bases_needed=0;
+		my $r_flanking_bases="";
+		if($matching_reference_repeat=~/$ref_overlapping_region(\S+)/)
+			{
+				$r_flanking_bases=$1;
+				$r_flanking_bases_needed=length($r_flanking_bases);
+			}	
+		
+		if($r_flanking_bases_needed >0) #--- that is need fixing on the right
+			{
+				#--- check how many bases are there on the right
+				if($qry_stop < length($qry_seq))
+					{
+						if($qry_seq=~/$gapless_qry_overlapping_region(\w{1,$r_flanking_bases_needed})$/)
+							{
+								$bases_available_on_right=$1;
+							}
+					}
+								
+				#if(($qry_stop + $r_flanking_bases_needed) <= length($qry_seq))
+				#	{
+				#		#--- get the available bases --
+				#		$bases_available_on_right=substr($qry_seq,$qry_stop,$r_flanking_bases_needed);
+				#	}
+				#elsif($qry_stop  < length($qry_seq))
+				#	{
+				#		my $nof_bases_available=length($qry_seq)-$qry_stop;
+				#		$bases_available_on_right=substr($qry_seq,$qry_stop,$nof_bases_available);
+				#	}
+					
+				
+				#--- identify how many gaps are needed
+				my $gaps_needed_on_the_right=$r_flanking_bases_needed-length($bases_available_on_right);				
+				for(my $i=1;$i<=$gaps_needed_on_the_right;$i++)
+					{
+						$gaps_right=$gaps_right."-";
+					}
+				
+						
+			}	
+
+
+		
+			#--- now create the repeat
+			$new_qry_start=$qry_start-length($bases_available_on_left);
+			$new_qry_stop=$qry_stop+length($bases_available_on_right);
+			$current_crispr_repeat=$gaps_left.$bases_available_on_left.$qry_overlapping_region.$bases_available_on_right.$gaps_right;
+			
+			return($new_qry_start,$new_qry_stop,$current_crispr_repeat);
+		
+		#return 1;
+	}
+
+
+
+sub calculate_array_quality_score()
+	{
+		my($range,$accession,$species,$matching_reference_repeat,$model_repeat,$current_array)=@_;
+		
+		my $array_quality_score=0;
+		#print "$range,$accession,$matching_reference_repeat,$model_repeat\n"; #exit;
+		
+		#----- first check the presence of Cas1 and Cas2 genes ------------------------------------------------
+		my %hash_of_cas_genes;
+		my $cas_score=0;
+		
+		#------------------------------------------------------------------------------------------------------
+		
+		
+		#--------- check if the model repeat or its reverse_comp match any existing repeat from the known repeats ----------
+		my $known_repeat_score=0;
+		my $model_repeat_rc=$model_repeat; $model_repeat_rc=reverse($model_repeat_rc);$model_repeat_rc=~tr/ACGTU/TGCAA/;
+		
+		
+		if($matching_reference_repeat!~/^NA/)
+			{
+				$known_repeat_score=3;
+			}
+		
+
+			
+			
+			
+		#------------------------------------------------------------------------------------------------------
+		
+		#--- check if model_repeat has ATTGAAA(N) in either end -----------------------------------------------
+		my $motif_match_score=0;
+		if(($model_repeat=~/ATTGAAA/i and $model_repeat=~/\w{15,}ATTGAAA.?$/i) or ($model_repeat_rc=~/ATTGAAA/i and $model_repeat_rc=~/\w{15,}ATTGAAA.?$/i))
+			{
+				#print "$model_repeat\n$model_repeat_rc\n";
+				$motif_match_score=3;
+			}
+		#------------------------------------------------------------------------------------------------------
+		
+		
+		#print "@{$current_array}\n";
+		#---- check if overall array identity is >90% ---------------------------------------------------------
+		my @arr_spacers;
+		my @arr_repeats;
+		my @arr_dotted_repeats;
+		
+		my $overall_repeats_identity_score=0;
+		my $avg_percent_identity=0;
+		my $nof_deleted_spacers=0;
+		for(my $k1=4;$k1<=$#{$current_array}-1;$k1++)
+			{
+						
+				my $current_line=$$current_array[$k1]; chomp $current_line; $current_line=~s/\r+//g; $current_line=~s/^\s+//;	#$current_line=~s/\s+/\t/g;							
+				
+				#print "A:\$current_line=$current_line\n";
+									
+				my @tmp_array=split('\t',$current_line);
+				my($r_start,$r_length,$s_length,$r_seq,$s_seq,$comment);
+								
+				$r_start=$tmp_array[0];
+				$r_seq=$tmp_array[1];
+				if(defined $tmp_array[2])
+					{
+						$s_seq=$tmp_array[2]; 
+					}
+				else{
+						$s_seq="";
+					}	
+				my $s_seq1=$s_seq;$s_seq1=~s/-//g;				
+				my $new_r_seq=&change_dots_to_bases($r_seq,$model_repeat);
+				
+				push(@arr_dotted_repeats,$r_seq);
+				push(@arr_repeats,$new_r_seq);
+				
+				if($k1<($#{$current_array}-1))
+					{
+						if($s_seq1 ne "")
+							{
+								push(@arr_spacers,$s_seq1);
+							}
+						else{
+								push(@arr_spacers,"-");
+								$nof_deleted_spacers++;
+							}		
+					}	
+				#my $similarity_score=length($model_repeat);
+				my $similarity_score=&get_similarity_score($new_r_seq,$model_repeat);	#print "\$similarity_score=$similarity_score\n";	
+				#print "\$similarity_score=$similarity_score\n";			
+				
+				my $percent_identity=0;
+				
+				if($similarity_score >0 and length($model_repeat)>0)
+					{
+						$percent_identity=$similarity_score/length($model_repeat)*100;
+						$percent_identity=sprintf("%.1f",$percent_identity);
+					}
+				$avg_percent_identity=$avg_percent_identity+$percent_identity;
+			}				   
+				   
+		$avg_percent_identity=$avg_percent_identity/($#arr_repeats+1);$avg_percent_identity=sprintf("%.1f",$avg_percent_identity);
+		$overall_repeats_identity_score=sprintf("%.2f",($avg_percent_identity-80)/20);	
+			
+			
+			
+			
+			
+		#---------- check if atleast 2 good repeats present ----------------------------------------------------------------------	
+		my $minimum_2_identical_repeats_score=0;
+		
+		my $identical_repeats_found=0;	
+		my $non_identical_repeats_found=0;		
+		my $total_mutations=0;	
+		foreach my $repeat(@arr_dotted_repeats)
+			{
+				#--- remove trailing gaps
+				$repeat=~s/^-+//;
+				$repeat=~s/-+$//;
+				
+				#-- if the repeat still contains letters and gaps; penalize it
+				if($repeat =~/[ACGTU-]/i)
+					{
+						$total_mutations=$total_mutations+length($repeat);
+						$non_identical_repeats_found++;						
+					}
+				#--- else count
+				if($repeat!~/[ACGTU-]/i){$identical_repeats_found++;}
+				
+			}		
+		
+		my $total_number_of_dr_clusters=1;
+		if($non_identical_repeats_found >0 and $total_mutations >$#arr_dotted_repeats+1)
+			{ 
+				$total_number_of_dr_clusters=int(&get_repeats_identity($range,$accession,\@arr_repeats)); 
+			}		
+		
+			
+		if($identical_repeats_found >=2 and $total_number_of_dr_clusters==1)
+			{
+				$minimum_2_identical_repeats_score=0.50;
+			}
+		elsif($identical_repeats_found<2 and $total_number_of_dr_clusters >1)# and $#arr_dotted_repeats>=2)
+			{
+				$minimum_2_identical_repeats_score=-1.50;
+			}	
+		#if($identical_repeats_found<2)# and $#arr_dotted_repeats>=2)
+		#	{
+		#		$minimum_2_identical_repeats_score=-1.50;
+		#	}	
+
+			
+		
+		#print "\$avg_percent_identity=$avg_percent_identity\t\$overall_repeats_identity_score=$overall_repeats_identity_score\n";
+
+
+
+
+
+
+
+
+		#----- score the $model_repeat length from the table of distributions ----------------------------------------------------
+		if($species eq "NA"){$species="bacteria";}
+		
+		my $model_repeat_distribution_score=0;
+		open(RD1,"$Bin/Ref_lib_files/ref_repeat_distribution.txt");
+		my @arr_t1=<RD1>;
+		close(RD1);
+		my %hash_of_repeat_lengths;
+		my $highest_peak=0;
+		foreach my $line(@arr_t1)
+			{
+				chomp $line;$line=~s/\r//g;
+				if($line=~/#/ or $line eq ""){next;}
+				
+				my @arr_t2=split('\t',$line);
+				
+				if($species=~/bacteria/i)
+					{
+						$hash_of_repeat_lengths{$arr_t2[0]}=$arr_t2[1];
+						if($arr_t2[1]>$highest_peak){$highest_peak=$arr_t2[1];}
+					}
+				elsif($species=~/archaea/i)
+					{
+						$hash_of_repeat_lengths{$arr_t2[0]}=$arr_t2[2];
+						if($arr_t2[2]>$highest_peak){$highest_peak=$arr_t2[2];}
+					}	
+			}
+		
+		if(length($model_repeat)>=23 and length($model_repeat)<=47)
+			{
+				if(defined $hash_of_repeat_lengths{length($model_repeat)})
+					{
+						$model_repeat_distribution_score=0.25+ sprintf("%.2f", $hash_of_repeat_lengths{length($model_repeat)}/$highest_peak);
+					}
+				else{
+						$model_repeat_distribution_score=0.25;
+					}		
+			}
+		else{
+				if(length($model_repeat)<23)
+					{
+						$model_repeat_distribution_score=-0.25*(23-length($model_repeat));
+					}
+				elsif(length($model_repeat)>47)
+					{
+						$model_repeat_distribution_score=-0.25*(length($model_repeat)-47);
+					}	
+				#$model_repeat_distribution_score=-0.50;
+			}	
+		
+		if($model_repeat_distribution_score< -1){$model_repeat_distribution_score= -1;}
+		if($model_repeat_distribution_score> 1){$model_repeat_distribution_score= 1;}
+		
+		#print "\$model_repeat_distribution_score=$model_repeat_distribution_score\n";
+		
+		
+		
+		
+		
+		
+		#------- average spacer length distribution score ------------------------------
+		my $average_spacer_length_distribution_score=0;
+		my $total_spacer_length_distribution_score=0;
+
+		open(RD2,"$Bin/Ref_lib_files/ref_spacer_distribution.txt");
+		my @arr_ts=<RD2>;
+		close(RD2);
+		
+		my %hash_of_spacer_lengths;
+		my $highest_peak2=0;
+		foreach my $line(@arr_ts)
+			{
+				chomp $line;$line=~s/\r//g;
+				if($line=~/#/ or $line eq ""){next;}
+				
+				my @arr_t2=split('\t',$line);
+				
+				$hash_of_spacer_lengths{$arr_t2[0]}=$arr_t2[1];
+				if($arr_t2[1]>$highest_peak2){$highest_peak2=$arr_t2[1];}
+	
+			}
+		foreach my $spacer(@arr_spacers)
+			{
+				if(length($spacer)>=28 and length($spacer)<=48)
+					{
+						if(defined $hash_of_spacer_lengths{length($spacer)})
+							{
+								$total_spacer_length_distribution_score=$total_spacer_length_distribution_score+0.01+ sprintf("%.2f", $hash_of_spacer_lengths{length($spacer)}/$highest_peak2);
+							}
+						else{
+								$total_spacer_length_distribution_score=$total_spacer_length_distribution_score+0.01;
+							}		
+					}
+				elsif(length($spacer)<28)
+					{
+						my $tmp_spacer_score=-0.10*(28-length($spacer));
+						#if($tmp_spacer_score<-1){$tmp_spacer_score= -1;}
+						
+						$total_spacer_length_distribution_score=$total_spacer_length_distribution_score+$tmp_spacer_score;
+					}
+				elsif(length($spacer)>48)
+					{
+						my $tmp_spacer_score=-0.10*(length($spacer)-48);
+						#if($tmp_spacer_score<-1){$tmp_spacer_score= -1;}
+						
+						$total_spacer_length_distribution_score=$total_spacer_length_distribution_score+$tmp_spacer_score;
+					}		
+			}
+			
+		if($total_spacer_length_distribution_score!=0)
+			{
+				if($#arr_spacers>0)
+					{
+						$average_spacer_length_distribution_score= sprintf("%.2f",$total_spacer_length_distribution_score/$#arr_spacers);
+					}
+				else{
+						$average_spacer_length_distribution_score=$total_spacer_length_distribution_score;
+					}		
+			}
+		if($average_spacer_length_distribution_score< -3){$average_spacer_length_distribution_score = -3;} #--- keeping and lower limit	
+		#print "\$average_spacer_length_distribution_score=$average_spacer_length_distribution_score \$total_spacer_length_distribution_score=$total_spacer_length_distribution_score\n";		
+		
+		
+		
+		#----------------------------------------------------------------------------------------------------------------------------------------
+		my $spacer_identity_score=0;
+
+		my $skip_1=1;
+		if($skip_1==0)
+		{
+		my $total_number_of_clusters=int(&get_spacers_identity($range,$accession,\@arr_spacers));
+		
+		if(not defined $total_number_of_clusters or $total_number_of_clusters==0)
+			{
+				select(undef, undef, undef, 1); #--- will sleep for 1/4 seconds
+				$total_number_of_clusters=int(&get_spacers_identity($range,$accession,\@arr_spacers));				
+			}
+		#print "\$total_number_of_clusters= $total_number_of_clusters\n";
+		if(defined $total_number_of_clusters and $total_number_of_clusters>0 and $total_number_of_clusters <= int(($#arr_spacers+1 -$nof_deleted_spacers)/2) ){$spacer_identity_score=-3;}
+		else{
+				$spacer_identity_score=0.2 * $total_number_of_clusters;
+				if($spacer_identity_score>1){$spacer_identity_score=1;}
+			}
+		#print "\$total_number_of_clusters=$total_number_of_clusters <= (($#arr_spacers+1)/2)\n";
+		}
+		#-----------------------------------------------------------------------------------------------------------------------------------------
+		
+		#------------------------ score total no of good repeats --------------------------------------------------------------------------------------
+		my $no_of_repeats_score=0;
+		
+		if($identical_repeats_found>0 and $#arr_repeats-$identical_repeats_found>0)
+			{
+				#$no_of_repeats_score=sprintf("%.2f",log($identical_repeats_found)-log($#arr_repeats-$identical_repeats_found));
+				$no_of_repeats_score=sprintf("%.2f",log($#arr_repeats+1)-log($#arr_repeats-$identical_repeats_found));
+			}
+		elsif($identical_repeats_found>0)
+			{
+				$no_of_repeats_score=sprintf("%.2f",log($identical_repeats_found));
+			}
+		if($no_of_repeats_score< -1){$no_of_repeats_score= -1;}
+		if($no_of_repeats_score>= 1){$no_of_repeats_score= 1;}
+		
+				
+		#-----------------------------------------------------------------------------------------------------------------------------------------
+		my $score_legend="1: cas, 2: matched_database_repeat, 3: motif_match, 4: overall_repeat_identity, 5: one_repeat_cluster, 6: exp_repeat_length, 7: exp_spacer_length, 8: spacer_identity, 9: log(total repeats) - log(total mutated repeats),";
+		my $score_det="1:$cas_score, 2:$known_repeat_score, 3:$motif_match_score, 4:$overall_repeats_identity_score, 5:$minimum_2_identical_repeats_score, 6:$model_repeat_distribution_score, 7:$average_spacer_length_distribution_score, 8:$spacer_identity_score, 9:$no_of_repeats_score,";
+		$array_quality_score=$cas_score+$known_repeat_score+$motif_match_score+$overall_repeats_identity_score+$minimum_2_identical_repeats_score+$model_repeat_distribution_score+$average_spacer_length_distribution_score+$spacer_identity_score+$no_of_repeats_score;
+		
+		return($array_quality_score,$score_det,$score_legend);
+		
+	}
+
+
+
+
+sub get_similarity_score()
+	{
+		my($current_repeat,$model_repeat)=@_;
+		
+		
+		
+		my $similarity_score=0;
+		
+		if(not defined $current_repeat or $current_repeat eq "" or $model_repeat eq ""){return $similarity_score;}
+		
+		
+		my @arr_1=split('',$current_repeat);
+		my @arr_2=split('',$model_repeat);
+		
+		
+		
+		for(my $i=0;$i<=$#arr_2;$i++)   
+			{
+				if(defined $arr_1[$i] and $arr_1[$i] eq $arr_2[$i])
+					{
+						$similarity_score=$similarity_score+1;	
+					}	
+			}
+		
+		return $similarity_score;
+	}
+
+
+
+sub get_repeats_identity()
+	{
+				my($range,$accession,$arr_repeats)=@_;
+				
+				
+				my $total_number_of_clusters=0;
+				
+				my $time_1 = &get_unique_id();		
+
+				$time_1="GSI_".$time_1.$accession.$range;	
+				
+				my $input_repeat_file=		$time_1."_repeats_in.txt";
+				my $output_repeat_file=		$time_1."_repeats_out.txt";
+				my $output_cluster_file=	$output_repeat_file.".clstr";
+							
+				
+				open(WR,">$tmp_dir\/$input_repeat_file") or print "$!";	
+				
+				#foreach my $repeat($$arr_repeats)
+				for(my $i=0;$i<=$#{$arr_repeats};$i++)
+					{		
+						#--- remove gaps from either ends
+						my $rep=$$arr_repeats[$i];
+						$rep=~s/^-+//;
+						$rep=~s/-+$//;
+										
+						print WR ">S_$i\n$rep\n";
+					}
+				close(WR);
+				
+				#print "";
+				system("cd-hit-est -i $tmp_dir\/$input_repeat_file -o $tmp_dir\/$output_repeat_file -n 3 -c 0.90 -l 5 >/dev/null 2>/dev/null");#
+				
+				if(-e "$tmp_dir\/$output_cluster_file")
+					{
+						$total_number_of_clusters=`grep 'Cluster' $tmp_dir\/$output_cluster_file | wc -l >&1`;
+						unlink("$tmp_dir\/$output_cluster_file");
+					}	
+				
+				if(not defined $total_number_of_clusters){$total_number_of_clusters=0;}
+				
+				unlink("$tmp_dir\/$input_repeat_file");
+				unlink("$tmp_dir\/$output_repeat_file");
+				
+				
+				return int($total_number_of_clusters);
+				
+			}		
+
+sub get_spacers_identity()
+	{
+				my ($range,$accession,$arr_spacers)=@_;
+				
+
+				
+				
+				my $total_number_of_clusters=0;
+				
+				my $time_1 = &get_unique_id();#."_".$t_seq_fragment;		
+
+				$time_1="GSI_".$time_1.$accession.$range;	
+				
+				my $input_spacer_file=		$time_1."_spacers_in.txt";
+				my $output_spacer_file=		$time_1."_spacers_out.txt";
+				my $output_cluster_file=	$output_spacer_file.".clstr";
+							
+				
+				open(WR,">$tmp_dir\/$input_spacer_file") or print "$!";	
+				
+				#foreach my $spacer($$arr_spacers)
+				for(my $i=0;$i<=$#{$arr_spacers};$i++)
+					{						
+						print WR ">S_$i\n$$arr_spacers[$i]\n";
+					}
+				close(WR);
+				
+				#print "";
+				system("cd-hit-est -i $tmp_dir\/$input_spacer_file -o $tmp_dir\/$output_spacer_file -n 3 -c 0.8 >/dev/null 2>&1"); #
+				
+				if(-e "$tmp_dir\/$output_cluster_file")
+					{
+						$total_number_of_clusters=`grep 'Cluster' $tmp_dir\/$output_cluster_file | wc -l >&1`;
+						unlink("$tmp_dir\/$output_cluster_file");
+					}	
+				
+				if(not defined $total_number_of_clusters){$total_number_of_clusters=0;}
+				
+				unlink("$tmp_dir\/$input_spacer_file");
+				unlink("$tmp_dir\/$output_spacer_file");
+				
+				
+				return int($total_number_of_clusters);
+				
+	}	
+	
+
+
+
+
+sub change_bases_to_dots()
+	{
+		my($bf_string,$mr_string)=@_;
+		
+		if(not $bf_string){return("");}
+		#print "\$bf_string,\$mr_string $bf_string,$mr_string\n";
+		my $return_string;
+		
+		my @arr_1=split('',$bf_string);
+		my @arr_2=split('',$mr_string);
+		
+		for(my $i=0;$i<=$#arr_2;$i++)
+			{
+				if(not defined $arr_1[$i])
+					{
+						$return_string=$return_string."-";
+					}
+				elsif($arr_1[$i] eq $arr_2[$i])
+					{
+						if($arr_2[$i] eq "-")
+							{
+								$return_string=$return_string."-";
+							}
+						else{
+								$return_string=$return_string.".";
+							}
+						
+					}
+				else{
+						$return_string=$return_string.$arr_1[$i];
+					}	
+			}
+		
+		return($return_string);
+	}
+
+
+
+	
+sub load_seqID_and_seq_in_hash()
+	{
+		my($input_seq_file,$hash_of_full_seqID_and_seq)=@_;
+		
+		#print "\$input_seq_file=$input_seq_file\n";
+		
+		
+		my $seq_index=0;
+		my $last_seq_id="";
+		my $seq="";
+		
+		open(RD,"$input_seq_file");
+		while( my $line=<RD> )
+			{				
+				chomp $line; $line=~ s/\r//; $line=~ s/^\s+//; 
+				#print "$line\n";
+				
+				if($line=~/^>/)
+					{
+						#print "matched\n";
+						if($seq_index>0)
+							{	
+								$hash_of_full_seqID_and_seq->{$last_seq_id}=$seq;
+								
+								$last_seq_id="";
+								$seq="";
+							}						
+						
+	
+						$last_seq_id=$line;	chomp $last_seq_id;$last_seq_id=~ s/\r//; $last_seq_id=~ s/^>//;												
+						$seq_index++;
+					}
+				else{						
+						$seq=$seq.$line;								
+					}																	 								 						 
+				#print WR "$line\n";												
+			 }
+
+		if($last_seq_id=~/\S+/ and $seq=~/\S+/)
+			{	
+				$hash_of_full_seqID_and_seq->{$last_seq_id}=$seq;							
+			}
+		close(RD); 
+	
+		return 1;
+	}	
+	
+	
+	
+sub load_seqID_seq_and_original_seq_header_in_hash()
+	{
+		my($input_seq_file,$hash_of_full_seqID_and_seq,$hash_of_simplified_read_id_and_original_read_id)=@_;
+		
+		#print "\$input_seq_file=$input_seq_file\n";
+		
+		
+		my $seq_index=0;
+		my $original_seq_id="";
+		my $seq="";
+		
+		my $new_seqID="";
+		
+		open(RD,"$input_seq_file");
+		while( my $line=<RD> )
+			{				
+				chomp $line; $line=~ s/\r//; $line=~ s/^\s+//; 
+				#print "$line\n";
+				
+				if($line=~/^>/)
+					{
+						#print "matched\n";
+						if($seq_index>0)
+							{	
+								$hash_of_full_seqID_and_seq->{$new_seqID}=$seq;
+								
+								$original_seq_id="";
+								$seq="";
+								$new_seqID="";
+							}						
+						
+	
+						$original_seq_id=$line;	chomp $original_seq_id;$original_seq_id=~ s/\r//; $original_seq_id=~ s/^>//;												
+						
+						$new_seqID="QUERY_$seq_index";
+						$hash_of_simplified_read_id_and_original_read_id->{$new_seqID}=$original_seq_id;
+						$seq_index++;
+					}
+				else{						
+						$seq=$seq.$line;								
+					}																	 								 						 
+				#print WR "$line\n";												
+			 }
+
+		if($original_seq_id=~/\S+/ and $seq=~/\S+/)
+			{	
+				$hash_of_full_seqID_and_seq->{$new_seqID}=$seq;							
+			}
+		close(RD); 
+	
+		return 1;
+	}	
+	
+
+sub get_unique_id()
+	{
+		my $letters="ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+		my @arr_letters=split('',$letters);		
+		my $unique_id = time();	   
+		for(my $i = 0; $i < int(rand(50)); $i++)
+			 {
+				$unique_id .= $arr_letters[int(rand($#arr_letters))];
+			 }
+		return $unique_id;	 
+	}
+
+
+sub reverse_an_array()
+	{
+		my($range,$accession,$model_repeat,$current_array,$modified_array)=@_;
+		#print "Going to to reverse the array of $accession:\n\n";
+		
+		my $case_found=0;
+		
+				
+		#--------- now, as the end of the array is found, now reverse the array
+	
+		for(my $k1=$#{$current_array}-1;$k1>4;$k1--)
+			{
+				#print "@{$current_array-[0]}\n";
+				my $current_line=$$current_array[$k1]; chomp $current_line; $current_line=~s/\r+//g; $current_line=~s/^\s+//;	#$current_line=~s/\s+/\t/g;
+				my $previous_line=$$current_array[$k1-1]; chomp $previous_line; $previous_line=~s/\r+//g; $previous_line=~s/^\s+//;	#$current_line=~s/\s+/\t/g;
+				
+							
+				#print "C: $current_line\n";		
+				
+				
+				#------------------- process the previous line -------------------------
+				
+				my @tmp_array2=split('\t',$previous_line);
+				my($p_r_start,$p_r_length,$p_s_length,$p_r_seq,$p_s_seq);
+				my $p_comment="";		
+				$p_r_start=$tmp_array2[0];
+				$p_r_seq=$tmp_array2[1]; my $p_r_seq_1=$p_r_seq;$p_r_seq_1=~s/-//g;
+				if($tmp_array2[2])
+					{
+						$p_s_seq=$tmp_array2[2]; 
+					}
+				else{
+						$p_s_seq="";
+					}		
+				my $p_s_seq_1=$p_s_seq;$p_s_seq_1=~s/-//g;
+				my $p_no_of_insertions=0;
+				
+				if($tmp_array2[3])
+					{
+						$p_comment=$tmp_array2[3];	$p_comment=~s/^\s+//;
+						if($p_comment)
+							{					
+								if($p_comment=~/^Del/)    # --- deletion anywhere ----
+									{
+										#$array_total_degeneracy=$array_total_degeneracy+1;
+										#next;
+									}
+								else{										
+										my @tmp_arr1=split(' ',$p_comment);
+												
+												#($cur_insertion_bases,$cur_insertion_positions)=split(' ',$cur_comment);
+										if(defined $tmp_arr1[0] and defined $tmp_arr1[1])
+											{		
+												my $p_insertion_bases=$tmp_arr1[0];
+												my $p_insertion_positions=$tmp_arr1[1];
+													$p_insertion_positions=~s/\[//g;
+													$p_insertion_positions=~s/\]//g;
+																#print "\$cur_insertion_bases=$cur_insertion_bases\n";
+												
+												my $comp_p_insertion_bases=$p_insertion_bases;
+												$comp_p_insertion_bases=~tr/ACGT/TGCA/;   #--- no need to reverse the string
+												
+																								
+												$p_insertion_bases=~s/,//g;
+												$p_no_of_insertions=length($p_insertion_bases);		
+												
+												$p_comment=$comp_p_insertion_bases." [".$p_insertion_positions."]";
+											}
+									}
+							}
+						
+					}
+				
+				
+				
+				#-------------------- process the current line ---------------------			
+				my @tmp_array=split('\t',$current_line);
+				my($c_r_start,$c_r_length,$c_s_length,$c_r_seq,$c_s_seq);
+				my $c_comment="";		
+				$c_r_start=$tmp_array[0];
+				$c_r_seq=$tmp_array[1]; my $c_r_seq_1=$c_r_seq;$c_r_seq_1=~s/-//g;
+				if(not defined $tmp_array[2]){$tmp_array[2]="";}
+				$c_s_seq=$tmp_array[2]; my $c_s_seq_1=$c_s_seq;$c_s_seq_1=~s/-//g;
+				
+				my $c_no_of_insertions=0;
+				
+				if($tmp_array[3])
+					{
+						$c_comment=$tmp_array[3];	$c_comment=~s/^\s+//;
+						if($c_comment)
+							{					
+								if($c_comment=~/^Del/)    # --- deletion anywhere ----
+									{
+										#$array_total_degeneracy=$array_total_degeneracy+1;
+										#next;
+									}
+								else{										
+										my @tmp_arr1=split(' ',$c_comment);
+												
+												#($cur_insertion_bases,$cur_insertion_positions)=split(' ',$cur_comment);
+										if(defined $tmp_arr1[0] and defined $tmp_arr1[1])
+											{		
+												my $c_insertion_bases=$tmp_arr1[0];
+												my $c_insertion_positions=$tmp_arr1[1];
+													$c_insertion_positions=~s/\[//g;
+													$c_insertion_positions=~s/\]//g;
+																#print "\$cur_insertion_bases=$cur_insertion_bases\n";
+												
+												my $comp_c_insertion_bases=$c_insertion_bases;
+												$comp_c_insertion_bases=~tr/ACGT/TGCA/;   #--- no need to reverse the string
+												
+																																	
+												$c_insertion_bases=~s/,//g;
+												$c_no_of_insertions=length($c_insertion_bases);	
+												
+												
+												$c_comment=$comp_c_insertion_bases." [".$c_insertion_positions."]";	
+											}
+									}
+							}
+						
+					}
+														
+				my $new_r_start=$c_r_start+length($c_r_seq_1)+$c_no_of_insertions;		
+				my $new_r_seq=$c_r_seq; $new_r_seq=reverse $new_r_seq;$new_r_seq=~tr/ACGT/TGCA/;
+				my $new_s_seq=$p_s_seq; $new_s_seq=reverse $new_s_seq;$new_s_seq=~tr/ACGT/TGCA/;
+			    #------------------------------------------------------------------------
+				#push(@arr_repeats,$r_seq);	
+				my $new_rec_line="";
+				$new_rec_line="$new_r_start\t$new_r_seq\t$new_s_seq\t$c_comment";
+				#print "\tD:$new_rec_line\n";
+				push(@{$modified_array},$new_rec_line);
+				
+				
+				#--- now create and push the last line ---------------------------------- 
+				if(($k1-1)==4)
+					{
+						my $l_r_start=$p_r_start+length($p_r_seq_1)+$p_no_of_insertions;
+						my $l_r_seq=$p_r_seq;  $l_r_seq=reverse $l_r_seq;$l_r_seq=~tr/ACGT/TGCA/;
+						my $l_s_seq="|";
+						my $l_comment=$p_comment;
+						
+						my $l_rec_line="$l_r_start\t$l_r_seq\t$l_s_seq\t$l_comment";
+						push(@{$modified_array},$l_rec_line);
+					}
+					
+				
+				
+				#print "$new_rec_line\n";	
+			}
+		
+		
+		$model_repeat=reverse $model_repeat; $model_repeat=~tr/ACGT/TGCA/;
+		$case_found=1;
+		return($model_repeat,$case_found);
+	}
+
+
+sub fix_arrays_with_gaps_in_model_repeat_repeat()
+	{
+		my($model_repeat,$current_array)=@_;
+		
+		if($model_repeat!~/-/)
+			{
+				return($model_repeat);
+			}
+			
+		#_---
+		my @arr_model_repeat_bases=split('',$model_repeat);	
+		
+		for(my $k1=4;$k1<=$#{$current_array}-1;$k1++)
+			{
+				#print "@{$current_array-[0]}\n";
+				my $current_line=$$current_array[$k1]; 
+				chomp $current_line; $current_line=~s/\r+//g; $current_line=~s/^\s+//;#$current_line=~s/\s+/\s/g;
+							
+					#print "$current_line\n";
+							
+				#my @tmp_array=split('\t',$current_line);
+				my($c_start,$c_repeat,$c_spacer,$c_comment)=split('\t',$current_line);
+				if(not $c_comment){$c_comment="";}
+				
+				my @arr_repeat_bases=split('',$c_repeat);
+				for(my $i=0;$i<=$#arr_model_repeat_bases;$i++)
+					{
+						if($arr_model_repeat_bases[$i] eq "-" ) #and $arr_repeat_bases[$i] eq "-")
+							{
+								$arr_repeat_bases[$i]="";
+							}
+					}
+				my $new_c_repeat=join("",@arr_repeat_bases);
+				my $row="$c_start\t$new_c_repeat\t$c_spacer\t$c_comment";	
+				$$current_array[$k1]=$row;
+			}
+		
+		#--- now remove the gaps from the model repeat --
+		$model_repeat=~s/-//g;
+		
+		return($model_repeat);
+	}
+	
+	
+sub display_help()
+	{
+		print qq~
+#### metaCRISPRDetect version 1.0:
+An ultrafast and highly accurate CRISPR array prediction tool for metagenomes. 
+
+The metaCRISPRDetect program offers rapid identification of CRISPR arrays in short reads with already provided reference CRISPR repeat databases (generated from all publicly available 
+archaea and bacterial genomic sequences, as well as CRISPR arrays predicted from several thousands metagenomic assemblies).
+ 
+
+
+#### metaCRISPRDetect dependencies:
+Please make sure that CRISPRDetect_3.0 (https://github.com/ambarishbiswas/CRISPRDetect_3.0) is properly installed and the program "CRISPRDetect3" is available in the PATH, which should 
+satisfy most 3rd party dependencies.
+
+Beside that you only need to install Megahit (version 1.2.9 or higher) or SPAdes (version 3.11.1 or higher) assembler and BBmap suite of tools also known as BBTools.
+
+	Megahit   [Download from https://github.com/voutcn/megahit]
+	SPAdes    [Download from https://github.com/ablab/spades]
+	BBMap     [Download from https://sourceforge.net/projects/bbmap/]
+
+
+#### metaCRISPRDetect Syntax:
+     
+     metaCRISPRDetect -sid ABCD -f test.fasta -o test 
+     
+#### metaCRISPRDetect examples:
+     
+     metaCRISPRDetect -sid ABCD -i test.fa -o test 
+     metaCRISPRDetect -sid ABCD -s test.fq.gz -o test -read_error_correction 1 -use_ref_repeats_from_assembly 1
+     metaCRISPRDetect -sid ABCD -1 forward_fastq_file -2 reverse_fastq_file -o test 
+
+
+#### metaCRISPRDetect commandline parmeters:
+
+  Options for input sequence(s) in FASTA format :
+ 	-i/-f	input_fasta_sequence_file	[either gzip compressed (i.e. with extension .gz) or uncompressed FASTA sequence file. Supported extensions are .fa, .fna, .fasta ]
+ 	-o/-out_dir	a_folder_name	[A folder with the provided name will be created in the current directory; No "/" or "\" is accepted]
+ 	-sid/-sample_id	TEXT	[This is a compulsory option; typical examples are: NCBI accessions, SRA accessions or any alphanumeric text ]
+
+
+  Options for input sequence(s) in FASTQ format ONLY :
+ 	-s/-r	input_fastq_sequence_file	[A FASTQ file. Supported extensions are .fq, .fastq with/without gzip compression (i.e. with extension .gz) ]
+	-1	forward_fastq_file	[Specify the forward reads FASTQ file of paired-end libraries. Supported extensions are .fq, .fastq with/without gzip compression (i.e. with extension .gz)]
+	-2	reverse_fastq_file	[Specify the reverse reads FASTQ file of paired-end libraries. Supported extensions are .fq, .fastq with/without gzip compression (i.e. with extension .gz)]
+	--12	interleaved_fastq_file	[Specify a FASTQ file with forward and reverse reads interleaved. Supported extensions are .fq, .fastq with/without gzip compression (i.e. with extension .gz)]
+
+
+  Options specific for reads in the inputted FASTA/FASQ file :
+ 	-read_error_correction	0/1	[Default is set to 1 (recomended). To skip error correction use 0]
+ 	-min_read_length	20	[Default value set to 20, Any positive integer is supported]
+
+
+  Options of assembly of reads in the inputted sequence file :
+ 	-use_ref_repeats_from_assembly	0/1	[Default is set to 0, which means no assembly will be done and CRISPR arrays will only be predicted from the inputted FASTA/FASTQ reads/sequences]
+ 	-assembler	megahit/spades	[Default set to Megahit; to use SPAdes assembler specify "-assembler spades"]
+ 	-assembled_contigs	FASTA_seq_file	[specify an existing (multi)FASTA sequence file, which will be used for generating reference CRISPR repeats library. File with extension .gz is supported]
+
+
+  Options for filtering CRISPR arrays :
+ 	-array_quality_score_cutoff	numeric_value	[default is set to 3, any positive or negative real numeric value is supported]
+ 	-minimum_no_of_repeats	integer_value	[Default is set to 2, any positive integer >1 is supported]
+
+
+  Options for additional file/format :
+ 	-create_repeats_fasta_file	0/1	[Default is set to 0, Use "1" to create a multiFASTA sequence file containing the repeats]
+ 	-create_spacers_fasta_file	0/1	[Default is set to 0, Use "1" to create a multiFASTA sequence file containing the spacers]
+ 	-create_gff_file	0/1	[Default is set to 0, Use "1" to create a GFF file containing the CRISPR element details]
+
+
+  Other options :
+ 	-T/-threads	number_of_threads	[By default the program uses 4 threads; Any positive integer is accepted]
+ 	-q/-quiet	0/1	[Default is set to 0, which shows program step-by-step logs; Use "1" to turn of the logging; Note, a file log.log will still be created in the output_folder]
+ 	-h/--h/-help/--help		[Shows this help]
+ 	-v/-version		[Shows version]
+
+
+
+If you use metaCRISPRDetect, then please cite:
+-----------------------------------------
+	Biswas, A., Staals, R. H., Morales, S. E., Fineran, P. C. & Brown, C. M. CRISPRDetect: a flexible algorithm to define CRISPR arrays. BMC Genomics 17, 356 (2016).
+
+For version updates and bug fixes refer to https://github.com/ambarishbiswas/metaCRISPRDetect_1.0 or email ambarishbiswas[at]gmail[dot]com  
+
+ 
+
+~;
+		return 1;
+	}	
+	
+
+
+######## old modules
+sub change_dots_to_bases()
+	{
+		my($r_string,$mr_string)=@_;
+		
+		if($r_string eq "" or $mr_string eq "" ){return("");}
+		#print "\$bf_string,\$mr_string $bf_string,$mr_string\n";
+		my $return_string;
+		
+		my @arr_1=split('',$r_string);
+		my @arr_2=split('',$mr_string);
+		
+		for(my $i=0;$i<=$#arr_2;$i++)
+			{
+				if($arr_1[$i] eq ".")
+					{
+						$return_string=$return_string.$arr_2[$i];
+					}
+				else{
+						$return_string=$return_string.$arr_1[$i];
+					}	
+			}
+		
+		return($return_string);
+	}
+
+
+sub identify_reads_with_at_least_two_repeats()
+	{
+		my($reads_file,$first_ref_mcl_repeat_sequences,$blast_output_file,$selected_reads_for_metacrisprdetect)=@_;
+		
+		
+		#---- now load the reads [remember some of the reads has space in the header so needs to be processed carefully]		
+		my %hash_of_qry_seqID_and_seq;
+		&load_seqID_and_seq_in_hash($reads_file,\%hash_of_qry_seqID_and_seq);
+		
+		#--- load the reference seqID and sequence in a hash
+		my %hash_of_first_ref_mcl_repeat_seqID_and_seq;
+		&load_seqID_and_seq_in_hash($first_ref_mcl_repeat_sequences,\%hash_of_first_ref_mcl_repeat_seqID_and_seq);
+		
+		#-----
+		
+				
+				
+								
+				
+				my %hash_of_qryID_direction_repeat_matching_regions_and_refID;
+				my %hash_of_qryID_and_seq_length;
+				
+				open(RD,"$blast_output_file");
+				while(my $row=<RD>)
+					{
+						#if($row !~/^REPEAT_/){next;}
+						
+						chomp $row; $row=~s/\r//;
+						
+						my @arr_r1=split('\t',$row);
+						my $refID=$arr_r1[0];
+						
+						#if($hash_of_negative_mclIDs{$refID})
+						#	{
+						#		next;
+						#	}
+						#-- get the MCLID
+						#my $mclID;
+						#if($refID=~/REPEAT_(MCLGROUP_\d+):S_/)
+						#	{
+						#		$mclID=$1;
+						#	}
+						#-----
+						my $qryID=$arr_r1[4];
+						my $aligned_overlap_start=$arr_r1[5];
+						my $aligned_overlap_stop=$arr_r1[6];
+						my $direction=$arr_r1[7];
+						
+						my $overlap_length=$arr_r1[8];
+						my $overlap_identity=$arr_r1[14];
+						
+						
+						my $ref_length=$arr_r1[$#arr_r1-1];
+						my $qry_length=$arr_r1[$#arr_r1];
+						
+						#--- calculate the ref_coverage
+						my $ref_coverage=int(($overlap_length/$ref_length)*100);
+						
+						if(not $hash_of_qryID_direction_repeat_matching_regions_and_refID{$qryID}{$direction} and $ref_coverage < 90)   #-- blast always reports the best/highes hit first, so this check will make sure that if there is a good hit already exist, then subsequent hits will be retained
+							{
+								next;
+							}
+						
+						#--- now check for overlapping predicted overlaps --
+						my $overlap_found=0;
+						
+						if($hash_of_qryID_direction_repeat_matching_regions_and_refID{$qryID}{'plus'})
+							{
+								foreach my $ex_start_and_stop(keys %{$hash_of_qryID_direction_repeat_matching_regions_and_refID{$qryID}{'plus'}})
+									{
+										my ($ex_start,$ex_stop)=split('-',$ex_start_and_stop);
+										
+										if($ex_start >= $aligned_overlap_start and $ex_start <= $aligned_overlap_stop)
+											{
+												$overlap_found++;										
+											}
+										if($ex_stop >= $aligned_overlap_start and $ex_stop <= $aligned_overlap_stop)
+											{
+												$overlap_found++;										
+											}
+										
+										
+										if($aligned_overlap_start >= $ex_start and $aligned_overlap_start <=  $ex_stop)
+											{
+												$overlap_found++;										
+											}
+										if($aligned_overlap_stop >= $ex_start and $aligned_overlap_stop <=  $ex_stop)
+											{
+												$overlap_found++;										
+											}	
+											
+										#--- if overlap found then get the old score ----	
+										if($overlap_found >0)
+											{												
+												last;
+											}
+												
+									}
+							}
+							
+						if($hash_of_qryID_direction_repeat_matching_regions_and_refID{$qryID}{'minus'})
+							{
+								foreach my $ex_start_and_stop(keys %{$hash_of_qryID_direction_repeat_matching_regions_and_refID{$qryID}{'minus'}})
+									{
+										my ($ex_start,$ex_stop)=split('-',$ex_start_and_stop);
+										
+										if($ex_start >= $aligned_overlap_start and $ex_start <= $aligned_overlap_stop)
+											{
+												$overlap_found++;										
+											}
+										if($ex_stop >= $aligned_overlap_start and $ex_stop <= $aligned_overlap_stop)
+											{
+												$overlap_found++;										
+											}
+										
+										
+										if($aligned_overlap_start >= $ex_start and $aligned_overlap_start <=  $ex_stop)
+											{
+												$overlap_found++;										
+											}
+										if($aligned_overlap_stop >= $ex_start and $aligned_overlap_stop <=  $ex_stop)
+											{
+												$overlap_found++;										
+											}	
+											
+										#--- if overlap found then get the old score ----	
+										if($overlap_found >0)
+											{												
+												last;
+											}
+												
+									}
+							}	
+						#----
+						if($overlap_found >0)
+							{
+								next;
+							}
+							
+						my $range="$aligned_overlap_start-$aligned_overlap_stop";
+						$hash_of_qryID_direction_repeat_matching_regions_and_refID{$qryID}{$direction}{$range}=$refID;
+						$hash_of_qryID_and_seq_length{$qryID}=$qry_length;
+						
+					}
+				close(RD);
+				
+				#--- now write the singleton hits
+				
+				my %hash_of_already_written_qryIDs;
+				open(WR,">$selected_reads_for_metacrisprdetect");
+				foreach my $qryID(keys %hash_of_qryID_direction_repeat_matching_regions_and_refID)
+					{
+						my $qry_length=$hash_of_qryID_and_seq_length{$qryID};
+						
+						my $nof_repeats_present_plus=0;
+						if($hash_of_qryID_direction_repeat_matching_regions_and_refID{$qryID}{'plus'})
+							{	
+								$nof_repeats_present_plus=keys %{$hash_of_qryID_direction_repeat_matching_regions_and_refID{$qryID}{'plus'}};
+							}
+							
+						my $nof_repeats_present_minus=0;
+						if($hash_of_qryID_direction_repeat_matching_regions_and_refID{$qryID}{'minus'})
+							{
+								$nof_repeats_present_minus=keys %{$hash_of_qryID_direction_repeat_matching_regions_and_refID{$qryID}{'minus'}};
+							}
+						
+						
+						if($nof_repeats_present_plus >1 or $nof_repeats_present_minus >1 )
+							{
+								#--- check that there was enough flanking region both side to accomodate additional repeat
+								if(not $hash_of_already_written_qryIDs{$qryID})
+									{
+										print WR ">$qryID\n$hash_of_qry_seqID_and_seq{$qryID}\n";
+										
+										$hash_of_already_written_qryIDs{$qryID}=1;
+									}
+																		
+							}
+					}
+				close(WR);
+				
+				
+				
+		
+		return 1;
+	}
+	
+
+
+
+
+sub identify_crisprs_with_at_least_one_repeat()
+	{
+		my($only_file_name,$reads_file,$first_ref_mcl_repeat_sequences,$blast_output_file,$tabular_metacrisprdetect_output)=@_;
+		
+		
+		#----- load the good reference seqID and sequence in a hash
+		my %hash_of_ref_repeat_seqID_and_seq;
+		&load_seqID_and_seq_in_hash($reference_repeatDB,\%hash_of_ref_repeat_seqID_and_seq);
+		
+		
+		
+		my $selected_reads_with_atleast_one_good_repeat_match="$tmp_dir/$only_file_name.selected_reads_with_atleast_one_good_repeat_match.fa";				
+		my $blast_output_file2="$selected_reads_with_atleast_one_good_repeat_match.blast_output_against_good_mcl_repeats.blastn";
+		
+		unless(-e "$blast_output_file2")
+			{	
+				#---- now load the reads [remember some of the reads has space in the header so needs to be processed carefully]		
+				my %hash_of_qry_seqID_and_seq;
+				&load_seqID_and_seq_in_hash($reads_file,\%hash_of_qry_seqID_and_seq);
+				
+				#--- load the reference seqID and sequence in a hash
+				my %hash_of_first_ref_mcl_repeat_seqID_and_seq;
+				&load_seqID_and_seq_in_hash($first_ref_mcl_repeat_sequences,\%hash_of_first_ref_mcl_repeat_seqID_and_seq);
+				
+				#-----	
+				my %hash_of_qryID_direction_repeat_matching_regions_and_refID;
+				my %hash_of_qryID_and_seq_length;
+				
+				
+				my %hash_of_qryIDs_with_atleast_one_good_hit;
+						
+				open(RD,"$blast_output_file");
+				while(my $row=<RD>)
+					{
+						#if($row !~/^REPEAT_/){next;}
+						
+						chomp $row; $row=~s/\r//;
+						
+						my @arr_r1=split('\t',$row);
+						my $refID=$arr_r1[0];
+						
+						
+						#--- exclude the negative repeat matching rows
+						#if($hash_of_negative_mclIDs{$refID})
+						#	{
+						#		next;
+						#	}
+							
+				
+						#-----
+						my $qryID=$arr_r1[4];
+						my $aligned_overlap_start=$arr_r1[5];
+						my $aligned_overlap_stop=$arr_r1[6];
+						my $direction=$arr_r1[7];
+						
+						my $overlap_length=$arr_r1[8];
+						my $overlap_identity=$arr_r1[14];
+						
+						
+						my $ref_length=$arr_r1[$#arr_r1-1];
+						my $qry_length=$arr_r1[$#arr_r1];
+						
+						#--- calculate the ref_coverage
+						my $ref_coverage=int(($overlap_length/$ref_length)*100);
+						
+						if($ref_coverage < 90)
+							{
+								next;
+							}
+							
+						$hash_of_qryIDs_with_atleast_one_good_hit{$qryID}=1;						
+						
+				}
+				close(RD);
+				
+				
+				#--- now write the qryID and sequences
+				
+				open(WR,">$selected_reads_with_atleast_one_good_repeat_match");		
+				foreach my $qryID(keys %hash_of_qryIDs_with_atleast_one_good_hit)
+					{
+						print WR ">$qryID\n$hash_of_qry_seqID_and_seq{$qryID}\n";						
+					}
+				close(WR);
+		
+		
+				#--- now blast the selected reads against $reference_repeatDB						
+		
+				system("perl /PROJECTS/custom_scripts/split_fasta_sequences_into_n_files_and_do_blast.pl -db $reference_repeatDB -i $selected_reads_with_atleast_one_good_repeat_match -o $blast_output_file2 -BTASK blastn-short -BN 1 -BUG 1 -n 2 -T 3 -BT 1 -p /tmp/$only_file_name -s reads ");
+				print "Check: $blast_output_file2 \n";
+		}
+		
+		
+		
+		#--- now process the blast_output_file2 and identify, extend, split repeat regions to create tabular CRISPRDetect output
+		#unless(-e "$tabular_metacrisprdetect_output")
+		#	{
+				
+				#--- load the selected reads
+				my %hash_of_selected_readID_and_seq;
+				&load_seqID_and_seq_in_hash($selected_reads_with_atleast_one_good_repeat_match,\%hash_of_selected_readID_and_seq);
+				
+				#system("perl /PROJECTS/custom_scripts/split_fasta_sequences_into_n_files_and_do_blast.pl -db $reference_repeatDB -i $selected_reads_with_atleast_one_good_repeat_match -o $blast_output_file2 -BTASK blastn -BW 7 -BN 1 -n 2 -T 3 -BT 1 -p /tmp/$only_file_name -s reads ");
+				
+				#print "Check 3: blast_output_file \n";
+				system("blastn -task blastn-short -word_size 7 -evalue 100 -dust no -culling_limit 1 -num_alignments 1 -num_threads 3 -db $reference_repeatDB -query $selected_reads_with_atleast_one_good_repeat_match -out $blast_output_file2 -outfmt '6 sseqid stitle sstart send qseqid qstart qend sstrand length score mismatch gaps sseq qseq pident qcovs slen qlen' >/dev/null 2>/dev/null");	
+
+				#print "Check: $blast_output_file2 \n";
+				
+				#------
+				my %hash_of_qryID_refID_and_direction;
+				my %hash_of_qryID_start_and_overlapping_regions;
+				
+				open(RD,"$blast_output_file2");
+				while(my $row=<RD>)
+					{
+						#if($row !~/^REPEAT_/){next;}
+						
+						chomp $row; $row=~s/\r//;
+						
+						my @arr_r1=split('\t',$row);
+						my $refID=$arr_r1[0];
+						
+						my $qryID=$arr_r1[4];
+						
+						my $aligned_overlap_start=$arr_r1[5];
+						my $aligned_overlap_stop=$arr_r1[6];
+						
+						my $direction=$arr_r1[7];
+						
+						my $ref_overlapping_region=$arr_r1[12];
+						my $qry_overlapping_region=$arr_r1[13];
+						
+						#--- exclude the negative repeat matching rows
+						#if($hash_of_negative_mclIDs{$refID})
+						#	{
+						#		next;
+						#	}
+						
+						
+						##--- get the ref sequence and extend to full length
+						#my $matching_reference_repeat=$hash_of_ref_repeat_seqID_and_seq{$refID};
+						#my $matching_reference_repeat_rc=reverse($matching_reference_repeat); $matching_reference_repeat_rc=~tr/ACGT/TGCA/;
+						
+						#if($direction eq 'minus')
+						#	{
+						#		$matching_reference_repeat=$matching_reference_repeat_rc;
+						#	}
+						
+						
+						##-- get the nof bases needed both side
+						#my $l_flanking_bases=0;
+						#if($matching_reference_repeat=~/(\S+)$ref_overlapping_region/)
+						#	{
+						#		$l_flanking_bases=$1;
+						#	}
+						#my $r_flanking_bases=0;
+						#if($matching_reference_repeat=~/$ref_overlapping_region(\S+)/)
+						#	{
+						#		$r_flanking_bases=$1;
+						#	}
+						
+						
+							
+						$hash_of_qryID_refID_and_direction{$qryID}="$refID|$direction";
+						
+						$hash_of_qryID_start_and_overlapping_regions{$qryID}{$aligned_overlap_start}=$qry_overlapping_region;
+							
+												
+					}
+				close(RD);
+				
+				#--- now process the reads --
+				open(TAB,">$tabular_metacrisprdetect_output");
+				foreach my $qryID(keys %hash_of_qryID_refID_and_direction)
+					{
+						my($refID,$direction)=split('\|',$hash_of_qryID_refID_and_direction{$qryID});
+						
+						my $nof_fragments=keys %{$hash_of_qryID_start_and_overlapping_regions{$qryID}};
+						
+						if($nof_fragments<=1)
+							{
+								next;
+							}
+												
+						my @arr_repeat_start_positions;
+						foreach my $start(sort{$a<=>$b} keys %{$hash_of_qryID_start_and_overlapping_regions{$qryID}})
+							{
+								push(@arr_repeat_start_positions,$start);								
+							}
+						
+						my $qry_seq=$hash_of_selected_readID_and_seq{$qryID};	
+						my @arr_repeats;
+						my @arr_spacers;	
+						for(my $i=0;$i<$#arr_repeat_start_positions;$i++)
+							{
+								my $c_start=$arr_repeat_start_positions[$i];								
+								my $c_repeat=$hash_of_qryID_start_and_overlapping_regions{$qryID}{$c_start};
+								
+								#-- remove gaps from c_repeat
+								my $gapless_c_repeat=$c_repeat;
+								if($c_repeat=~/-/)
+									{
+										$gapless_c_repeat=~s/-+//g;
+									}
+								my $c_stop=$c_start+length($gapless_c_repeat)-1;
+								
+								my $n_start=$arr_repeat_start_positions[$i+1];
+								my $spacer_length=$n_start-$c_stop;
+								
+								#if($c_stop+$spacer_length > length($qry_seq)){next;}
+								
+								my $c_spacer=substr($qry_seq,$c_stop,$spacer_length);
+								
+								push(@arr_repeats,"$c_start:$c_repeat");
+								push(@arr_spacers,"$c_stop:$c_spacer");
+								
+								if($i+1 == $#arr_repeat_start_positions)
+									{
+										push(@arr_repeats,"$n_start:$hash_of_qryID_start_and_overlapping_regions{$qryID}{$n_start}");
+									}								
+							}	
+						
+						#--- now print to the table
+						my $repeats=join(",",@arr_repeats);
+						my $spacers=join(",",@arr_spacers);
+						
+						print TAB "$refID\t$qryID\t$direction\t$repeats\t$spacers\n";
+						
+						#print "$qry_seq\n\t$refID\t$qryID\t$direction\t$repeats\t$spacers\n\n";
+							
+						#-- get the ref sequence
+						#my $matching_reference_repeat=$hash_of_ref_repeat_seqID_and_seq{$refID};
+						#my $matching_reference_repeat_rc=reverse($matching_reference_repeat); $matching_reference_repeat_rc=~tr/ACGT/TGCA/;
+						#my $mid_pos=int(length($matching_reference_repeat)/2));
+						
+						#--- create a pattern
+						#my $matching_reference_repeat_l6_bases=substr($matching_reference_repeat,0,6);
+						#my $matching_reference_repeat_t6_bases=substr($matching_reference_repeat,-6);						
+						#my $matching_reference_repeat_m6_bases=substr($matching_reference_repeat,$mid_pos-3,6);
+						
+						#my $pat="$matching_reference_repeat_l6_bases?\w{1,$mid_pos}";
+						
+						
+					}
+				close(TAB);	
+				
+				print "Check: $tabular_metacrisprdetect_output\n";
+		#	}	
+		
+		
+		return 1;
+	}
+
+
+exit;
